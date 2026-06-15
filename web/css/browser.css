@@ -1,0 +1,291 @@
+#app {
+  display: grid;
+  grid-template-rows: 1fr auto auto;
+  height: 100vh;
+}
+
+/* Two rows: a header strip (row 1) and the scrolling body (row 2).
+   The files header spans both the files and preview columns so the header
+   visually has only two cells — one for Mount, one for the files area. */
+.grid {
+  display: grid;
+  grid-template-columns: 220px 1fr 30%;
+  grid-template-rows: auto 1fr;
+  min-height: 0;
+  background: var(--bg);
+}
+.grid > .col-head-mount {
+  grid-column: 1;
+  grid-row: 1;
+}
+.grid > .col-head-files {
+  grid-column: 2 / span 2;
+  grid-row: 1;
+}
+.grid > .col.mounts {
+  grid-column: 1;
+  grid-row: 2;
+}
+.grid > .col.files {
+  grid-column: 2;
+  grid-row: 2;
+}
+.grid > .col.preview {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.col:last-child {
+  border-right: none;
+}
+
+/* Fixed height (not min-height) + box-sizing means borders count toward
+   the 56px, so the two remaining headers stay identical in height whether
+   or not one is showing the active-column 2px top border. */
+.col-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 20px;
+  background: var(--bg-dark);
+  color: var(--cyan);
+  border-top: 2px solid transparent;
+  border-bottom: 1px solid var(--border);
+  height: 56px;
+  box-sizing: border-box;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* Active column (Tab toggles this) highlights the corresponding head. */
+.grid[data-active="mounts"] > .col-head-mount,
+.grid[data-active="files"] > .col-head-files {
+  border-top-color: var(--blue);
+}
+.col[data-active="true"] .list {
+  outline: none;
+}
+
+.crumbs {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.crumbs .sep {
+  color: var(--comment);
+  margin: 0 6px;
+}
+.crumbs a {
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.crumbs a:hover {
+  color: var(--blue);
+}
+.crumbs .cur {
+  color: var(--blue);
+}
+
+.filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.filter .filter-ic {
+  color: var(--blue);
+  font-size: 18px;
+}
+.filter input {
+  width: 240px;
+  font-size: 15px;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  font-size: 16px;
+}
+.list:focus {
+  outline: none;
+}
+.list li {
+  padding: 6px 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  line-height: 1.35;
+}
+.list li .k {
+  color: var(--yellow);
+  width: 1.6em;
+  display: inline-block;
+}
+.list li .ic {
+  width: 1.2em;
+  display: inline-block;
+  text-align: center;
+  color: var(--comment);
+  font-size: 17px;
+}
+.list li.dir .ic {
+  color: var(--magenta);
+}
+.list li.video .ic {
+  color: var(--cyan);
+}
+.list li.other .ic {
+  color: var(--comment);
+}
+.list li[data-focus="true"] {
+  background: var(--bg-sel);
+}
+.list li .meta {
+  margin-left: auto;
+  color: var(--comment);
+  font-size: 13px;
+}
+/* watch-progress marker fed by the player's resume positions */
+.list li .meta .resume {
+  color: var(--blue);
+  opacity: 0.7;
+  margin-right: 8px;
+}
+
+/* mount list */
+.mounts .list li {
+  font-size: 16px;
+}
+.mounts .list li[data-active="true"] .label {
+  color: var(--blue);
+}
+
+/* preview column */
+.preview .preview-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px 16px;
+  gap: 14px;
+  overflow-y: auto;
+  min-width: 0;
+  flex: 1;
+}
+#preview-img {
+  width: 100%;
+  max-width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+  background: var(--bg-dark);
+  border: 1px solid var(--border);
+}
+#preview-img[src=""],
+#preview-img:not([src]) {
+  display: none;
+}
+.preview .meta {
+  color: var(--fg-dim);
+  font-size: 13px;
+  width: 100%;
+}
+.preview .meta .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.preview .meta .row .k {
+  color: var(--comment);
+}
+
+.mobile-nav-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: var(--bg-dark);
+  border-top: 1px solid var(--border);
+}
+.mobile-nav-toggle {
+  align-self: center;
+  margin: 4px 0;
+  font-size: 30px;
+  padding: 2px 14px;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.mobile-nav-toggle:hover {
+  background: var(--bg);
+}
+.mobile-nav {
+  display: flex;
+  padding: 6px;
+  gap: 4px;
+  justify-content: center;
+  border-top: 1px solid var(--border);
+}
+.mobile-nav[hidden] {
+  display: none;
+}
+.mobile-nav button {
+  font-size: 40px;
+  padding: 6px 10px;
+}
+.mobile-nav .sep {
+  border-left: 1px solid var(--border);
+  margin: 0 4px;
+}
+
+.statusbar {
+  background: var(--bg-dark);
+  color: var(--comment);
+  border-top: 1px solid var(--border);
+  padding: 4px 14px;
+  font-size: 13px;
+  min-height: 24px;
+}
+.statusbar .ok {
+  color: var(--green);
+}
+.statusbar .err {
+  color: var(--red);
+}
+
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: 120px 1fr;
+  }
+  .grid > .col-head-files {
+    grid-column: 2;
+  }
+  .preview {
+    display: none;
+  }
+  .filter input {
+    width: 140px;
+  }
+}

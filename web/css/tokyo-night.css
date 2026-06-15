@@ -1,0 +1,126 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+:root {
+  --bg: #1a1b26;
+  --bg-dark: #16161e;
+  --bg-hl: #292e42;
+  --bg-sel: #364a82;
+  --fg: #c0caf5;
+  --fg-dim: #a9b1d6;
+  --comment: #565f89;
+  --blue: #7aa2f7;
+  --cyan: #7dcfff;
+  --green: #9ece6a;
+  --magenta: #bb9af7;
+  --red: #f7768e;
+  --orange: #ff9e64;
+  --yellow: #e0af68;
+  --border: #1f2335;
+  --mono:
+    "JetBrains Mono", "JetBrainsMono Nerd Font", "FiraCode Nerd Font",
+    "Hack Nerd Font", "Symbols Nerd Font", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  /* Firefox/IE — no visible scrollbar anywhere; content still scrolls
+     via keyboard, mouse wheel, or scrollIntoView. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select {
+  background: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  font-family: var(--mono);
+  font-size: inherit;
+  border-radius: 2px;
+}
+button:hover,
+select:hover {
+  background: var(--bg-hl);
+  cursor: pointer;
+}
+button:focus,
+input:focus,
+select:focus {
+  outline: 1px solid var(--blue);
+  outline-offset: -1px;
+}
+
+.icon {
+  color: var(--blue);
+  margin-right: 6px;
+}
+
+/* Modal — shared */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal[hidden] {
+  display: none;
+}
+.modal-card {
+  background: var(--bg-dark);
+  border: 1px solid var(--border);
+  min-width: 360px;
+  max-width: 90vw;
+  padding: 12px 16px;
+}
+.modal-head {
+  color: var(--blue);
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+.modal-body {
+  margin-bottom: 12px;
+}
+.modal-body input[type="text"] {
+  width: 100%;
+}
+.modal-body ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.modal-body li {
+  padding: 4px 6px;
+  cursor: pointer;
+}
+.modal-body li[data-selected="true"] {
+  background: var(--bg-sel);
+}
+.modal-foot {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}

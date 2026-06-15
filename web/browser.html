@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>mediaplayer</title>
+    <link rel="stylesheet" href="/css/tokyo-night.css" />
+    <link rel="stylesheet" href="/css/browser.css" />
+  </head>
+  <body data-view="browser">
+    <div id="app">
+      <main class="grid" id="grid">
+        <div class="col-head col-head-mount" id="head-mount">Mount</div>
+        <div class="col-head col-head-files" id="head-files">
+          <div class="crumbs" id="crumbs"></div>
+          <div class="filter" id="filter" hidden>
+            <span class="filter-ic">⌕</span>
+            <input id="filter-input" type="text" placeholder="filter…" />
+          </div>
+        </div>
+
+        <section class="col mounts" id="col-mounts">
+          <ul id="mount-list" class="list" tabindex="0"></ul>
+        </section>
+
+        <section class="col files" id="col-files">
+          <ul id="file-list" class="list" tabindex="0"></ul>
+        </section>
+
+        <section class="col preview" id="col-preview">
+          <div class="preview-body">
+            <img id="preview-img" alt="" />
+            <div id="preview-meta" class="meta"></div>
+          </div>
+        </section>
+      </main>
+
+      <div class="mobile-nav-wrap" id="mobile-nav-wrap">
+        <button
+          class="mobile-nav-toggle"
+          id="mobile-nav-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="mobile-nav"
+          title="toggle nav"
+        >
+          ☰
+        </button>
+        <nav class="mobile-nav" id="mobile-nav" hidden>
+          <button data-act="up" title="up">▲</button>
+          <button data-act="down" title="down">▼</button>
+          <button data-act="enter" title="open">▶</button>
+          <span class="sep"></span>
+          <button data-act="sort" title="sort">⇅</button>
+          <button data-act="filter" title="filter">⌕</button>
+          <button data-act="rename" title="rename">✎</button>
+          <button data-act="delete" title="delete">✖</button>
+        </nav>
+      </div>
+
+      <footer class="statusbar" id="statusbar"></footer>
+    </div>
+
+    <!-- Modals -->
+    <div class="modal" id="modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head" id="modal-title"></div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-foot">
+          <button id="modal-ok"></button>
+          <button id="modal-cancel"></button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/js/api.js"></script>
+    <script src="/js/browser.js"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>mediaplayer · play</title>
+    <link rel="stylesheet" href="/css/tokyo-night.css" />
+    <link rel="stylesheet" href="/css/player.css" />
+  </head>
+  <body data-view="player">
+    <div id="player-root">
+      <div class="stage">
+        <video id="video" playsinline controls></video>
+      </div>
+      <nav class="player-nav" id="player-nav">
+        <label class="nav-item">
+          <span class="nav-ic" aria-hidden="true">⚙</span>
+          <select id="quality" aria-label="quality">
+            <option value="auto">auto</option>
+            <option value="source">source</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+          </select>
+        </label>
+        <label class="nav-item" id="audio-item" hidden>
+          <span class="nav-ic" aria-hidden="true">🗣</span>
+          <select id="audio" aria-label="audio track"></select>
+        </label>
+        <button id="mute" title="mute (m)" aria-label="mute">
+          <span class="nav-ic">🔊</span>
+        </button>
+        <button id="close" title="close (Esc)" aria-label="close">
+          <span class="nav-ic">✕</span>
+        </button>
+      </nav>
+      <div id="status" class="status"></div>
+    </div>
+
+    <!-- hls.js for non-native HLS browsers (Chrome/Firefox). Optional; Safari has native HLS. -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"
+      onerror="window.__hlsjsFailed = true"
+    ></script>
+    <script src="/js/api.js"></script>
+    <script src="/js/player.js"></script>
+  </body>
+</html>
