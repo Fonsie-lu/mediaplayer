@@ -315,19 +315,20 @@
   // matter where focus landed — clicking the native video timeline moves focus
   // into the controls' shadow DOM, which would otherwise swallow the keydown
   // before the document-level handler below sees it.
-  window.addEventListener(
-    "keydown",
-    (ev) => {
-      const tag = document.activeElement && document.activeElement.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (ev.key === "q" || ev.key === "Escape") {
-        ev.preventDefault();
-        ev.stopPropagation();
-        closeAndLeave();
-      }
-    },
-    true,
-  );
+  function closeKeyHandler(ev) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (ev.key === "q" || ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      closeAndLeave();
+    }
+  }
+  window.addEventListener("keydown", closeKeyHandler, true);
+  // Belt-and-suspenders: also bind on the video itself in the capture phase so
+  // the key is intercepted even if a browser routes it directly to the focused
+  // media element before window capture (some engines do for media controls).
+  video.addEventListener("keydown", closeKeyHandler, true);
 
   document.addEventListener("keydown", (ev) => {
     if (

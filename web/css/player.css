@@ -48,6 +48,9 @@
   padding: 0 6px;
   color: var(--fg-dim);
 }
+.player-nav .nav-item[hidden] {
+  display: none;
+}
 .player-nav .nav-ic {
   font-size: 18px;
   line-height: 1;

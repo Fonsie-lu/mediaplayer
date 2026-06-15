@@ -34,6 +34,17 @@ func defaultConfigPath() string {
 	return filepath.Join(dir, "mediaplayer.json")
 }
 
+// defaultStarsPath returns ~/.config/mediaplayer-stars.json (via
+// os.UserConfigDir, so XDG_CONFIG_HOME is honored), falling back to the working
+// directory when no home is resolvable.
+func defaultStarsPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "mediaplayer-stars.json"
+	}
+	return filepath.Join(dir, "mediaplayer-stars.json")
+}
+
 func main() {
 	cfgPath := flag.String("config", defaultConfigPath(), "path to config.json")
 	flag.Parse()
@@ -50,8 +61,8 @@ func main() {
 	mgr := session.NewManager()
 	mgr.StartReaper()
 
-	// Starred entries persist to stars.json in the project root (working dir).
-	stars, err := api.NewStarStore("stars.json")
+	// Starred entries persist to ~/.config/mediaplayer-stars.json.
+	stars, err := api.NewStarStore(defaultStarsPath())
 	if err != nil {
 		log.Fatalf("stars: %v", err)
 	}
