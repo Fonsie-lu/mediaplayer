@@ -12,6 +12,7 @@ import (
 type Handler struct {
 	Cfg      *config.Config
 	Sessions *session.Manager
+	Stars    *StarStore
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -26,6 +27,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stream/close", h.streamClose)
 	mux.HandleFunc("/api/stream/hls/", h.streamHLS) // /api/stream/hls/{sid}/{file}
 	mux.HandleFunc("/api/config", h.configRW)
+	mux.HandleFunc("/api/stars", h.getStars)
+	mux.HandleFunc("/api/stars/toggle", h.toggleStar)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

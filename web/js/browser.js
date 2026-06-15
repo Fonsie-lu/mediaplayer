@@ -8,6 +8,7 @@
     focus: 0,
     sort: localStorage.getItem("mp.sort") || "ctime_desc",
     filter: "",
+    stars: new Set(), // keys: `${mountIdx}:${rel_path}`
     // cursorMemory[`${mountIdx}:${path}`] = focus index
     cursorMemory: JSON.parse(localStorage.getItem("mp.cursor") || "{}"),
     previewReq: 0,
@@ -64,6 +65,33 @@
     target.focus({ preventScroll: true });
   }
 
+  function starKey(e) {
+    return `${state.mountIdx}:${e.rel_path}`;
+  }
+
+  async function loadStars() {
+    try {
+      const refs = await api.stars();
+      state.stars = new Set(refs.map((r) => `${r.mount}:${r.path}`));
+    } catch (_) {
+      state.stars = new Set();
+    }
+  }
+
+  async function toggleStar() {
+    const e = currentEntry();
+    if (!e) return;
+    const key = starKey(e);
+    try {
+      const res = await api.toggleStar(state.mountIdx, e.rel_path);
+      if (res.starred) state.stars.add(key);
+      else state.stars.delete(key);
+      renderFiles();
+    } catch (err) {
+      status("star failed: " + err.message, "err");
+    }
+  }
+
   async function loadMounts() {
     try {
       state.mounts = await api.mounts();
@@ -92,6 +120,7 @@
     if (i < 0 || i >= state.mounts.length) return;
     state.mountIdx = i;
     state.path = "";
+    clearFilter();
     renderMounts();
     await loadDir();
   }
@@ -145,6 +174,7 @@
       a.addEventListener("click", () => {
         const p = a.dataset.path || "";
         state.path = p;
+        clearFilter();
         loadDir();
       });
     });
@@ -183,6 +213,9 @@
       if (r && r.dur) {
         const pct = Math.min(99, Math.round((r.t / r.dur) * 100));
         meta = `<span class="resume">▍ ${pct}%</span>` + meta;
+      }
+      if (state.stars.has(starKey(e))) {
+        meta = `<span class="star">★</span>` + meta;
       }
       li.innerHTML = `<span class="ic">${icon}</span><span class="name">${escape(e.name)}</span><span class="meta">${meta}</span>`;
       li.addEventListener("click", () => {
@@ -278,6 +311,7 @@
     if (e.is_dir) {
       saveCursor();
       state.path = e.rel_path;
+      clearFilter();
       loadDir(0);
     } else {
       openFocused();
@@ -303,6 +337,7 @@
     const childName = state.path.split("/").pop();
     saveCursor();
     state.path = state.path.split("/").slice(0, -1).join("/");
+    clearFilter();
     loadDir().then(() => {
       const idx = state.filtered.findIndex((e) => e.name === childName);
       if (idx >= 0) {
@@ -460,6 +495,13 @@
     if (el.filter.hidden) openFilter();
     else closeFilter(false);
   }
+  // Drop the active filter when navigating to a different directory so the
+  // new listing starts unfiltered. Same-dir reloads (rename/delete/sort) keep it.
+  function clearFilter() {
+    state.filter = "";
+    if (!el.filter.hidden) el.filter.hidden = true;
+    el.filterInput.value = "";
+  }
 
   // ---------- Keybinds ----------
   document.addEventListener("keydown", (ev) => {
@@ -583,6 +625,10 @@
         askDelete();
         ev.preventDefault();
         break;
+      case "y":
+        toggleStar();
+        ev.preventDefault();
+        break;
       case "f":
       case "/":
         toggleFilter();
@@ -692,5 +738,5 @@
     }
   });
 
-  loadMounts();
+  loadStars().then(loadMounts);
 })();

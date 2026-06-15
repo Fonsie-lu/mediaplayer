@@ -49,7 +49,14 @@ func main() {
 
 	mgr := session.NewManager()
 	mgr.StartReaper()
-	h := &api.Handler{Cfg: cfg, Sessions: mgr}
+
+	// Starred entries persist to stars.json in the project root (working dir).
+	stars, err := api.NewStarStore("stars.json")
+	if err != nil {
+		log.Fatalf("stars: %v", err)
+	}
+
+	h := &api.Handler{Cfg: cfg, Sessions: mgr, Stars: stars}
 
 	mux := http.NewServeMux()
 	h.Register(mux)

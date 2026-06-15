@@ -171,6 +171,11 @@
   opacity: 0.7;
   margin-right: 8px;
 }
+/* favorite/star marker, toggled with the `y` keybind */
+.list li .meta .star {
+  color: var(--yellow, #e5c07b);
+  margin-right: 8px;
+}
 
 /* mount list */
 .mounts .list li {

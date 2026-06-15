@@ -60,6 +60,16 @@ window.api = {
   closeStream() {
     return this.json("/api/stream/close", { method: "POST" });
   },
+  stars() {
+    return this.json("/api/stars");
+  },
+  toggleStar(mount, path) {
+    return this.json("/api/stars/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mount: String(mount), path }),
+    });
+  },
   getConfig() {
     return this.json("/api/config");
   },
