@@ -21,7 +21,15 @@ go test -v -run TestName ./...          # single test
 
 ## Architecture
 
-Stdlib-only Go backend + vanilla JS frontend. `//go:embed all:web` bakes all static assets into the binary.
+Stdlib-only HTTP/streaming backend + vanilla JS frontend. `//go:embed all:web` bakes all static assets into the binary. The one third-party dependency is the optional terminal UI (Bubble Tea / Lip Gloss, in `internal/tui`); the server, API, transcode, and session layers remain stdlib-only.
+
+### TUI control panel & startup modes
+
+`main.go` decides at startup whether to run the TUI: when both stdin and stdout are TTYs and `-no-tui` is not set, the HTTP server runs in a background goroutine and `tui.Run` takes the foreground; otherwise it stays headless and blocks on `SIGINT`/`SIGTERM` exactly as before. In TUI mode the standard logger is redirected (`log.SetFlags(0)` + `log.SetOutput(applog.Default)`) into `internal/applog`, an in-memory ring buffer — writing to stderr would corrupt the rendered UI.
+
+`internal/applog` parses each log line for a `[session <id>]` tag and remembers the filename from `opened path=… dur=` lines (session id → file map), so the Logs tab can group entries by `(session, filename)`. It exposes a `Version()` counter the TUI polls (700ms `tea.Tick`) to know when to rebuild.
+
+`internal/tui` is a single Bubble Tea model (`Model`) with three tabs — Mounts, Stars, Logs — and vim navigation (`j`/`k`, `g`/`G`, `tab`/`1`·`2`·`3`). Mounts edits go through `config.Replace` (persisted + live); Stars uses the new exported `StarStore.List`/`Remove`; Logs renders collapsible per-group rows with a per-group entry count (the "sum"). `ctrl+r` sets `Model.restart` and quits; `main` then runs the normal graceful shutdown (`CloseAll` + `srv.Shutdown`) before `reexec()` calls `syscall.Exec` on the same binary/args/env. Because the listener is closed on exec and the server was already shut down, the re-exec'd process rebinds the port cleanly.
 
 ### Stream decision flow
 

@@ -15,9 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	"mediaplayer/internal/api"
+	"mediaplayer/internal/applog"
 	"mediaplayer/internal/config"
 	"mediaplayer/internal/session"
+	"mediaplayer/internal/tui"
 )
 
 //go:embed all:web
@@ -47,7 +51,17 @@ func defaultStarsPath() string {
 
 func main() {
 	cfgPath := flag.String("config", defaultConfigPath(), "path to config.json")
+	noTUI := flag.Bool("no-tui", false, "run headless (no terminal UI even on a TTY)")
 	flag.Parse()
+
+	// The TUI takes over the terminal by default when attached to one; redirect
+	// the logger into an in-memory buffer (its Logs tab) so it doesn't corrupt
+	// the rendered UI. Headless runs keep logging to stderr as before.
+	useTUI := !*noTUI && isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
+	if useTUI {
+		log.SetFlags(0)
+		log.SetOutput(applog.Default)
+	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -113,12 +127,46 @@ func main() {
 		}
 	}()
 
+	shutdown := func() {
+		log.Println("shutting down, cleaning transcode sessions...")
+		mgr.CloseAll()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}
+
+	if useTUI {
+		restart, err := tui.Run(cfg, stars, applog.Default, "http://"+addr)
+		shutdown()
+		if err != nil {
+			log.SetOutput(os.Stderr)
+			log.Fatalf("tui: %v", err)
+		}
+		if restart {
+			reexec()
+		}
+		return
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
-	log.Println("shutting down, cleaning transcode sessions...")
-	mgr.CloseAll()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
+	shutdown()
+}
+
+// reexec replaces the current process image with a fresh copy of the executable,
+// preserving the original arguments and environment. The listening socket is
+// closed on exec (Go sets close-on-exec), so the restarted process rebinds the
+// port; the server was already gracefully shut down by the caller.
+func reexec() {
+	exe, err := os.Executable()
+	if err != nil {
+		log.SetOutput(os.Stderr)
+		log.Fatalf("restart: %v", err)
+	}
+	args := append([]string{exe}, os.Args[1:]...)
+	if err := syscall.Exec(exe, args, os.Environ()); err != nil {
+		log.SetOutput(os.Stderr)
+		log.Fatalf("restart: %v", err)
+	}
 }

@@ -96,6 +96,30 @@ func (s *StarStore) toggle(ref StarRef) (bool, error) {
 	return starred, nil
 }
 
+// List returns the starred refs in stable order (for the TUI / external use).
+func (s *StarStore) List() []StarRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.list()
+}
+
+// Remove deletes ref from the store and persists. A no-op if not present.
+func (s *StarStore) Remove(ref StarRef) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := ref.key()
+	old, ok := s.set[k]
+	if !ok {
+		return nil
+	}
+	delete(s.set, k)
+	if err := s.save(); err != nil {
+		s.set[k] = old // roll back so memory matches disk
+		return err
+	}
+	return nil
+}
+
 func (h *Handler) getStars(w http.ResponseWriter, r *http.Request) {
 	h.Stars.mu.Lock()
 	out := h.Stars.list()
