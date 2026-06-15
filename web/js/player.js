@@ -95,7 +95,11 @@
 
   function renderAudioTracks() {
     const tracks = probe.audio_tracks || [];
-    if (tracks.length < 2) return;
+    if (tracks.length < 2) {
+      audioSel.innerHTML = "";
+      audioItem.hidden = true;
+      return;
+    }
     audioSel.innerHTML = "";
     tracks.forEach((t) => {
       const o = document.createElement("option");
@@ -307,16 +311,30 @@
     } catch (_) {}
   });
 
+  // Close keys are handled in the capture phase on window so they fire no
+  // matter where focus landed — clicking the native video timeline moves focus
+  // into the controls' shadow DOM, which would otherwise swallow the keydown
+  // before the document-level handler below sees it.
+  window.addEventListener(
+    "keydown",
+    (ev) => {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (ev.key === "q" || ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeAndLeave();
+      }
+    },
+    true,
+  );
+
   document.addEventListener("keydown", (ev) => {
     if (
       ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)
     )
       return;
     switch (ev.key) {
-      case "Escape":
-      case "q":
-        closeAndLeave();
-        break;
       case " ":
         video.paused ? video.play() : video.pause();
         ev.preventDefault();
