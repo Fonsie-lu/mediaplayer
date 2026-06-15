@@ -8,9 +8,9 @@ package tui
 import (
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"mediaplayer/internal/api"
 	"mediaplayer/internal/applog"
@@ -104,7 +104,7 @@ func Run(cfg *config.Config, stars *api.StarStore, logs *applog.Store, addr stri
 	m.reloadMounts()
 	m.reloadStars()
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m)
 	fm, err := p.Run()
 	if err != nil {
 		return false, err
@@ -143,7 +143,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tick()
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		// Modal states capture all input.
 		if m.confirm != cfNone {
 			return m.updateConfirm(msg)
@@ -235,9 +235,13 @@ func (m Model) contentHeight() int {
 	return h
 }
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
+	v := tea.NewView("")
+	v.AltScreen = true
+
 	if m.width == 0 {
-		return "loading…"
+		v.Content = "loading…"
+		return v
 	}
 
 	// Tab bar.
@@ -269,13 +273,14 @@ func (m Model) View() string {
 
 	help := helpStyle.Render(m.helpLine())
 
-	view := lipgloss.JoinVertical(lipgloss.Left, bar, body, status, help)
-
 	if m.confirm != cfNone {
 		modal := modalStyle.Render(m.confirmMsg)
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+		v.Content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+		return v
 	}
-	return view
+
+	v.Content = lipgloss.JoinVertical(lipgloss.Left, bar, body, status, help)
+	return v
 }
 
 func (m Model) helpLine() string {

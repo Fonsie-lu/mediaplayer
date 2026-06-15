@@ -5,7 +5,7 @@ import (
 	"path"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"mediaplayer/internal/applog"
 )
@@ -96,7 +96,7 @@ func (m Model) updateLogs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.setCollapsedAtSel(false)
 	case "h", "left":
 		m.setCollapsedAtSel(true)
-	case "enter", " ", "o":
+	case "enter", "space", "o":
 		m.toggleAtSel()
 	case "E":
 		for _, r := range m.logRows {
