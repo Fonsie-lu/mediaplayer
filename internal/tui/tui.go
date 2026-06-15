@@ -6,6 +6,7 @@
 package tui
 
 import (
+	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
@@ -279,7 +280,15 @@ func (m Model) View() tea.View {
 		return v
 	}
 
-	v.Content = lipgloss.JoinVertical(lipgloss.Left, bar, body, status, help)
+	// The footer (URL + key bindings) is pinned to the bottom of the window:
+	// a flexible gap absorbs the slack when the tab body doesn't fill the area.
+	top := lipgloss.JoinVertical(lipgloss.Left, bar, body)
+	footer := lipgloss.JoinVertical(lipgloss.Left, status, help)
+	gap := m.height - lipgloss.Height(top) - lipgloss.Height(footer) + 1
+	if gap < 1 {
+		gap = 1
+	}
+	v.Content = top + strings.Repeat("\n", gap) + footer
 	return v
 }
 
