@@ -9,8 +9,60 @@
   </head>
   <body data-view="player">
     <div id="player-root">
-      <div class="stage">
+      <!-- The OSD and the help card live inside .stage because fullscreen is
+           requested on .stage, and only the fullscreen element's subtree is
+           rendered — anything outside it would vanish in fullscreen. -->
+      <div class="stage" id="stage">
         <video id="video" playsinline controls></video>
+        <div id="osd" class="osd" hidden aria-live="polite"></div>
+        <div id="help" class="modal" hidden>
+          <div class="modal-card">
+            <div class="modal-head">Keyboard shortcuts</div>
+            <div class="modal-body">
+              <ul class="keys">
+                <li>
+                  <span><kbd>space</kbd></span
+                  ><span class="desc">play / pause</span>
+                </li>
+                <li>
+                  <span><kbd>h</kbd> <kbd>l</kbd></span>
+                  <span class="desc">seek back / forward 5s</span>
+                </li>
+                <li>
+                  <span><kbd>j</kbd> <kbd>k</kbd></span>
+                  <span class="desc">seek back / forward 1 min</span>
+                </li>
+                <li>
+                  <span><kbd>↑</kbd> <kbd>↓</kbd></span>
+                  <span class="desc">volume ±10%</span>
+                </li>
+                <li>
+                  <span><kbd>0</kbd>…<kbd>9</kbd></span>
+                  <span class="desc">jump to 0–90% of the video</span>
+                </li>
+                <li>
+                  <span><kbd>m</kbd></span
+                  ><span class="desc">mute</span>
+                </li>
+                <li>
+                  <span><kbd>f</kbd></span
+                  ><span class="desc">fullscreen</span>
+                </li>
+                <li>
+                  <span><kbd>q</kbd> <kbd>esc</kbd></span>
+                  <span class="desc">close and go back</span>
+                </li>
+                <li>
+                  <span><kbd>?</kbd></span
+                  ><span class="desc">this help</span>
+                </li>
+              </ul>
+            </div>
+            <div class="modal-foot">
+              <button id="help-close">close</button>
+            </div>
+          </div>
+        </div>
       </div>
       <nav class="player-nav" id="player-nav">
         <label class="nav-item">
@@ -30,7 +82,14 @@
         <button id="mute" title="mute (m)" aria-label="mute">
           <span class="nav-ic">🔊</span>
         </button>
-        <button id="close" title="close (Esc)" aria-label="close">
+        <button
+          id="help-btn"
+          title="keyboard shortcuts (?)"
+          aria-label="shortcuts"
+        >
+          <span class="nav-ic">?</span>
+        </button>
+        <button id="close" title="close (q or Esc)" aria-label="close">
           <span class="nav-ic">✕</span>
         </button>
       </nav>

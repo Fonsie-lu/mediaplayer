@@ -35,7 +35,7 @@ The following must be on the host's `PATH`:
 
 A **Nerd Font** must be installed on the _client_ for the file-browser icon glyphs to render.
 
-Go 1.25+ is needed to build.
+Go 1.26+ is needed to build (the `go` directive in `go.mod`).
 
 ## Build & run
 
@@ -137,16 +137,23 @@ All keys below work in the browser (the web client). They are vim-flavored; arro
 
 ### Player (`/player`)
 
-| Key         | Action                                  |
-| ----------- | --------------------------------------- |
-| `Space`     | Play / pause                            |
-| `l` / `→`   | Seek forward 5s                         |
-| `h` / `←`   | Seek back 5s                            |
-| `k`         | Seek forward 30s                        |
-| `j`         | Seek back 30s                           |
-| `m`         | Mute / unmute                           |
-| `f`         | Toggle fullscreen                       |
-| `q` / `Esc` | Close the player and return to browsing |
+| Key          | Action                                  |
+| ------------ | --------------------------------------- |
+| `Space`      | Play / pause                            |
+| `l` / `→`    | Seek forward 5s                         |
+| `h` / `←`    | Seek back 5s                            |
+| `k`          | Seek forward 1 min                      |
+| `j`          | Seek back 1 min                         |
+| `↑` / `↓`    | Volume ±10% (unmutes when raised)       |
+| `1`–`9`, `0` | Jump to 10%–90%, `0` jumps to the start |
+| `m`          | Mute / unmute                           |
+| `f`          | Toggle fullscreen                       |
+| `?`          | Show the shortcut list                  |
+| `q` / `Esc`  | Close the player and return to browsing |
+
+Seeks and volume changes flash a brief on-screen readout, since the native
+controls auto-hide. `Esc` closes the shortcut list first if it's open, and while
+fullscreen it's left to the browser for leaving fullscreen.
 
 ## How it works
 

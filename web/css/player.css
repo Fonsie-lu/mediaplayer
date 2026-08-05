@@ -11,6 +11,8 @@
   justify-content: center;
   align-items: center;
   padding: 24px;
+  /* anchors the OSD overlay */
+  position: relative;
 }
 #video {
   width: 75vw;
@@ -19,8 +21,51 @@
   border: 1px solid var(--border);
 }
 /* Pure black letterbox/pillarbox so any aspect-ratio mismatch between the
-   display and the video fills the gaps with pitch black, not Tokyo Night dark. */
-#video:fullscreen,
+   display and the video fills the gaps with pitch black, not Tokyo Night dark.
+   Fullscreen is requested on .stage (so the OSD and help card stay visible),
+   but the native controls' own fullscreen button targets the video element —
+   both paths are styled. */
+/* Each selector gets its own rule on purpose: a comma-joined list is dropped
+   in full by any browser that can't parse one of its selectors, so pairing the
+   standard :fullscreen with the legacy -webkit- alias would lose both. */
+.stage:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  padding: 0;
+  background: #000;
+}
+.stage:-webkit-full-screen {
+  width: 100vw;
+  height: 100vh;
+  padding: 0;
+  background: #000;
+}
+/* object-fit: contain is already the UA default for <video>; stated here so the
+   frame is explicitly letterboxed inside the now-larger stage, never stretched. */
+.stage:fullscreen #video {
+  width: 100%;
+  height: 100%;
+  max-height: 100vh;
+  border: none;
+  background: #000;
+  object-fit: contain;
+}
+.stage:-webkit-full-screen #video {
+  width: 100%;
+  height: 100%;
+  max-height: 100vh;
+  border: none;
+  background: #000;
+  object-fit: contain;
+}
+/* The native controls' own fullscreen button targets the video element itself. */
+#video:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  max-height: 100vh;
+  border: none;
+  background: #000;
+}
 #video:-webkit-full-screen {
   width: 100vw;
   height: 100vh;
@@ -28,9 +73,59 @@
   border: none;
   background: #000;
 }
-#video:fullscreen::backdrop,
-#video:-webkit-full-screen::backdrop {
+.stage:fullscreen::backdrop {
   background: #000;
+}
+#video:fullscreen::backdrop {
+  background: #000;
+}
+
+/* On-screen feedback for keyboard actions. The native controls auto-hide, so
+   without this a keyboard seek or volume change gives no visible response. */
+.osd {
+  position: absolute;
+  top: 44px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: rgba(22, 22, 30, 0.88);
+  color: var(--fg);
+  font-size: 14px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.osd[hidden] {
+  display: none;
+}
+
+/* Help card key list */
+.keys {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+}
+.keys li {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 14px;
+  align-items: baseline;
+  padding: 3px 0;
+}
+.keys .desc {
+  color: var(--fg-dim);
+}
+kbd {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--bg-hl);
+  color: var(--cyan);
 }
 .player-nav {
   display: flex;

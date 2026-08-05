@@ -8,9 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 make build                              # go build -o mediaplayer .
 make run                                # go run .
 make test                               # go test -v ./...
+make fmt                                # gofmt -w .
+make clean                              # rm binary + /tmp/mediaplayer-* (session AND preview caches)
 go test -v -run TestName ./...          # single test
+./mediaplayer                           # default config ~/.config/mediaplayer.json (XDG_CONFIG_HOME honored)
 ./mediaplayer -config /path/config.json # alternate config
+./mediaplayer -no-tui                   # headless even on a TTY
 ```
+
+Tests are pure unit tests (`sortEntries`, `safeJoin`, `NumSegments`/`PlaylistText`, `parseKeyframeCSV`/`BuildBoundaries`, `pickPreferredAudio`) — none shell out to ffmpeg, so `make test` runs anywhere. The streaming path (batching, session concurrency, ffmpeg arg construction) has **no** automated coverage; verify those changes by playing a real file.
+
+Go floor is the `go` directive in `go.mod` (1.26.0); the repo is kept `gofmt -l`-clean, and gofmt's comment-alignment rules shift between releases, so run `make fmt` after editing rather than hand-aligning trailing comments. `min`/`max` are the language builtins — `internal/tui` used to carry int-only copies that shadowed them; don't reintroduce those.
 
 ## External dependencies (must be on PATH)
 
@@ -29,7 +37,9 @@ Stdlib-only HTTP/streaming backend + vanilla JS frontend. `//go:embed all:web` b
 
 `internal/applog` parses each log line for a `[session <id>]` tag and remembers the filename from `opened path=… dur=` lines (session id → file map), so the Logs tab can group entries by `(session, filename)`. It exposes a `Version()` counter the TUI polls (700ms `tea.Tick`) to know when to rebuild.
 
-`internal/tui` is a single Bubble Tea model (`Model`) with three tabs — Mounts, Stars, Logs — and vim navigation (`j`/`k`, `g`/`G`, `tab`/`1`·`2`·`3`). Mounts edits go through `config.Replace` (persisted + live); Stars uses the new exported `StarStore.List`/`Remove`; Logs renders collapsible per-group rows with a per-group entry count (the "sum"). `ctrl+r` sets `Model.restart` and quits; `main` then runs the normal graceful shutdown (`CloseAll` + `srv.Shutdown`) before `reexec()` calls `syscall.Exec` on the same binary/args/env. Because the listener is closed on exec and the server was already shut down, the re-exec'd process rebinds the port cleanly.
+`internal/tui` is a single Bubble Tea model (`Model`) with three tabs — Mounts, Stars, Logs — and vim navigation (`j`/`k`, `g`/`G`, `tab`/`shift+tab`/`H`/`L`/`[`/`]`/`1`·`2`·`3`). Mounts edits go through `config.Replace` (persisted + live); Stars uses the exported `StarStore.List`/`Remove`; Logs renders collapsible per-group rows with a per-group entry count (the "sum"). Destructive actions route through one shared confirm modal (`confirmKind`: delete mount, unstar, restart) that swallows all input while open, so `ctrl+r` prompts before it sets `Model.restart` and quits; `main` then runs the normal graceful shutdown (`CloseAll` + `srv.Shutdown`) before `reexec()` calls `syscall.Exec` on the same binary/args/env. Because the listener is closed on exec and the server was already shut down, the re-exec'd process rebinds the port cleanly.
+
+The TUI is the _only_ consumer of `StarStore.List`/`Remove` and of `applog` — both exist for it, so don't inline them away when refactoring the API package.
 
 ### Stream decision flow
 
@@ -56,17 +66,71 @@ Both modes set `-muxdelay 0` + `-avoid_negative_ts make_non_negative` so segment
 
 No `-re`: bounded batch length is the rate limit.
 
+#### Seek-landing correction (both modes)
+
+Where `-ss` lands is container-dependent, and a batch whose first segment is missing its head leaves a hole at the seek position that no amount of refetching fills (hls.js backtracks to `n-1`, whose batch has the same defect, and stalls). Containers with a real keyframe index (matroska cues, mp4 `stss`) land at or _before_ the target; index-less ones (mpegts DVB recordings) binary-search to a byte offset and usable content only begins at the next keyframe — possibly seconds _after_ it. So `StartBatch` probes the landing first (`probeLanding` in remux mode — a 1-frame `-c copy` replay of the same seek; `keyframeLanding` in encode mode — a demux-only `ffprobe -read_intervals` scan), and when the landing overshoots, backs `seekAt` off and re-probes, up to 3 tries. Each mode then reconciles the early start differently, and this is where the two `-output_ts_offset` values come from:
+
+- **Remux** keeps the early packets (copied data can't be trimmed): `anchor` = landed keyframe PTS, `-t` is extended by the landing slop, `-segment_times` are measured relative to `anchor`, and `tsOffset = seekAt` undoes the `-ss` rebase exactly. The batch's first segment simply starts a little early; PTS stay source-true so players align by timestamp.
+- **Encode** decodes early then trims: `-vf trim=start=<backoff>,setpts=PTS-<backoff>/TB` (before any `scale`) cuts output back to exactly `StartSec` and re-bases the timebase, so `-t`, `-force_key_frames` and `tsOffset = StartSec` all see the same 0-at-`StartSec` timeline as the no-backoff path. A filter can't touch copied audio, so **any nonzero backoff forces an audio re-encode** even for otherwise-copyable aac/mp3 (`-af atrim,asetpts` mirrors the video trim).
+
+Both probes are best-effort: on error the code proceeds with the uncorrected seek and logs a "first segment will be short" warning rather than failing the batch.
+
 ### Session lifecycle
 
 `internal/session/manager.go` maps cookie `mp_sid` → active `Session`. One transcode per cookie; `Adopt()` stops the previous batch and `RemoveAll`s its temp dir before swapping in the new one. SIGINT/SIGTERM triggers `CloseAll()` (which also stops the reaper). The `/api/stream/direct` handler calls `Close(sid)` so opening a direct-playback video releases any prior transcode session. `StartReaper()` runs a 30s ticker that closes sessions idle > `IdleTimeout` (10 min) — safety net for browsers that close without firing `pagehide`/`/api/stream/close`. `CleanStaleTempDirs()` runs at startup to wipe leftover `mediaplayer-sess-*` dirs from prior crashed runs.
 
+### Caching layers
+
+Four independent caches, none of them shared:
+
+- `transcode.probeCache` — ffprobe results keyed `path|size|mtime`, max 512 entries, **flushed wholesale** when full (not LRU). Exists because the player page probes a file and then opens a stream within the same second.
+- `transcode.keyframeCache` — same key scheme, max 128, same flush-all policy. The scan demuxes every packet header (seconds on large files over network mounts) for a tiny result.
+- Preview thumbnails — a **stable** dir `$TMPDIR/mediaplayer-previews`, sha1(`path|mtime|size`) filenames, so they survive restarts and don't accumulate one dir per launch. Concurrent requests for the same thumbnail serialize on a per-cachePath mutex in a `sync.Map` (`thumbGen`) instead of spawning duplicate `ffmpegthumbnailer` runs. `CleanStaleTempDirs` deliberately does not touch this dir (it only matches `mediaplayer-sess-*`); `make clean` does.
+- Session segment dirs — `os.MkdirTemp("", "mediaplayer-sess-")`, per session, deleted on session shutdown.
+
+### Stars
+
+Server-side, not localStorage: `internal/api/stars.go` persists `[]StarRef{mount, path}` to `~/.config/mediaplayer-stars.json` (path chosen in `main.go::defaultStarsPath`, so `XDG_CONFIG_HOME` applies). `mount` is the mount **index as a string** (whatever the client sent), keyed `mount + ":" + path` — so renumbering mounts orphans stars. Every mutation rewrites the whole file and rolls the in-memory set back if the write fails, keeping memory and disk in sync. Endpoints: `GET /api/stars`, `POST /api/stars/toggle`. The browser page mirrors them into a `Set` at load and renders a `★` in the meta column; `y` toggles.
+
+Note `.gitignore` still lists a root-level `stars.json` from before the move into `~/.config`.
+
 ### Path safety
 
-`internal/api/paths.go::safeJoin` prepends `/` then `filepath.Clean`s the user-supplied rel path before joining, so `../../../etc` collapses to `/etc` and joins under the mount root rather than escaping. Every handler that touches the filesystem goes through it.
+`internal/api/paths.go::safeJoin` runs **two** checks, and both are load-bearing. Every handler that touches the filesystem goes through `Handler.target`/`queryTarget`, which wrap it.
+
+1. **Lexical** — prepend `/`, `filepath.Clean`, join onto the mount root, then require the result to be the root or `root + separator`-prefixed (`within`). Prepending `/` first is what makes `../../../etc` collapse to `/etc` and land _inside_ the mount instead of climbing out.
+2. **Symlink** — `resolveExisting` on both the root and the joined path, then the same `within` check. Clean can't see links; one stored in a mount may point anywhere on the host. `filepath.EvalSymlinks` errors on missing paths, so `resolveExisting` resolves the longest existing prefix and re-appends the rest verbatim — a component that doesn't exist can't be a link, and rename destinations legitimately don't exist yet.
+
+Order matters and is deliberate: because `..` is collapsed _before_ any link is traversed, `escape/../out` (where `escape` → outside) names `root/out` rather than following the link out the way the OS would. Consequences worth knowing:
+
+- Symlinks **inside** one mount work. Links leaving a mount are rejected — including into _another_ configured mount, and including deleting a stray outward link via `/api/delete` (it 400s instead).
+- `safeJoin` returns the **unresolved** path. `del` compares it against `mount.Path` and `rename` rebuilds sibling paths from it; resolving would break both when a mount root is itself a symlink (which is supported and tested).
+- A prefix that exists but can't be resolved (permissions) is left as-is rather than failing the request — the handler's own filesystem call rejects it anyway.
+
+The check is resolve-then-open, so it is not TOCTOU-proof: anything able to create a symlink inside a mount between the check and the handler's `open` can still win the race. Only the app itself writes into mounts (`rename`), so this is accepted, not solved — don't describe `safeJoin` as airtight against a local attacker with write access to a mount.
+
+`TestSafeJoinSymlinks` builds a real tree (inside-link, escaping dir link, escaping file link, symlinked mount root) — extend it rather than reasoning about this by hand.
 
 ### Frontend state
 
-`web/js/browser.js` is a single IIFE with a flat `state` object. Cursor memory (per `{mountIdx, path}`) and sort preference persist in localStorage. All vim bindings live in one `keydown` handler; mounts 1-9/0 jump by index. Filter, sort, rename, delete share a single reusable modal.
+`web/js/browser.js` is a single IIFE with a flat `state` object. Cursor memory (per `{mountIdx, path}`) and sort preference persist in localStorage. All vim bindings live in one `keydown` handler; mounts 1-9/0 jump by index. Filter, sort, rename, delete share a single reusable modal. `web/js/api.js` is the only place that builds API URLs — add endpoints there, not inline in the pages.
+
+Keyboard is the primary interface but not the only one: below 900px (`@media` in `browser.css`) the mounts column collapses into a tap-driven `.mobile-nav` whose open state persists under `mp.mobilenav.open`. Keep new actions reachable from both.
+
+#### Player keyboard handling (non-obvious, verified in-browser)
+
+Chromium's native media controls live in a **closed user-agent shadow root** that swallows `keydown` outright: once a click lands on the play button or the scrubber, the event never reaches the page — not the document, not even a capture-phase listener on `window`. This is why the shortcuts appeared dead "when focus is on player elements", and the old capture-phase workaround for `q`/`Esc` never actually fixed that case either.
+
+No pointer event escapes that shadow root either, so `focusin` on the video is the only usable signal. The player bounces pointer-driven focus back to the document there, keeping `:focus-visible` focus (real Tab navigation) intact. Two details are load-bearing:
+
+- The blur **must be deferred** (`setTimeout(…, 0)`). Called synchronously inside the `focusin` dispatch it is ignored — the browser is mid-focus-assignment and re-applies focus.
+- Mouse use of the controls is unaffected: clicking and dragging the scrubber still seek, because those are driven by pointer capture, not focus.
+
+Everything else goes through one `keydown` listener on `window` in the **capture** phase, which `stopImmediatePropagation`s the keys it owns. Without that, the native controls also act on arrows/space (double seeks) and a focused nav button gets re-clicked by `space`. A focused `<select>` keeps only the keys it needs to operate (arrows, space, Enter, Escape, Home/End, PageUp/Down) — everything else still reaches the player, which is what makes the shortcuts survive using the quality/audio dropdowns.
+
+Fullscreen is requested on `#stage`, **not** the `<video>`: only the fullscreen element's subtree renders, so fullscreening the bare video would hide the OSD and the shortcut card. The OSD and help card therefore live inside `.stage` in the markup. `Esc` while fullscreen is deliberately left to the browser (it would otherwise both exit fullscreen and leave the page).
+
+There's a browser-driven test harness pattern that verified all of the above (real Chromium via puppeteer-core against `/usr/bin/chromium`, real key/mouse events, focus parked on each element in turn). It's worth rebuilding for any further key-handling change — this behavior is not reasonable to verify by reading code.
 
 Resume positions live in localStorage under `mp.resume` (`"<mount>:<path>" → {t, dur, ts}`, capped at 200 entries, cleared when the playhead passes 95%). The player page writes them (throttled `timeupdate`, plus close/pagehide) and seeks to the stored position on open; the browser page renders them as a dim `▍ NN%` marker in the file list's meta column. While an HLS session is open the player also refetches the playlist every 4 min as a keepalive so a paused video isn't reaped by the 10-min idle timer (every HLS request `Touch()`es the session).
 
@@ -83,4 +147,7 @@ Resume positions live in localStorage under `mp.resume` (`"<mount>:<path>" → {
 - Per-directory cursor memory (selected index preserved when navigating in/out of folders) is spec, not polish. Stored in `localStorage` under `mp.cursor`.
 - Mount keybinds: `1`–`9` index 0–8, `0` indexes 9 (tenth mount). The spec says "1–10", treat as positional.
 - Icons are Nerd Font glyphs — need a Nerd Font installed on the client for them to render.
-- Sort default is `ctime_desc` (created newest first).
+- Sort default is `ctime_desc` (created newest first), and folders always sort before files regardless of the key.
+- `ctime` needs a `syscall.Stat_t`, so `internal/api/ctime_linux.go` / `ctime_other.go` are build-tagged; the non-Linux fallback returns mtime. Keep both in sync when touching `FileEntry`.
+- `/api/stream/open` still accepts the legacy `t` (start seconds) param and `api.js` still sends it, but the server ignores it — with VOD playlists the client seeks via standard HLS instead of re-spawning at an offset. Don't reintroduce a dependency on it.
+- Mount edits are live: `/api/config` POST and the TUI both call `config.Replace`, which mutates the shared `*config.Config` under its own lock and persists. Handlers must read mounts through `Snapshot()`/`MountByIndex()`, never cache them.

@@ -17,10 +17,10 @@ import (
 
 // Tunables. Spec: 1 min of buffering is sufficient.
 const (
-	SegDuration = 4.0  // seconds per HLS segment
-	BatchSize   = 16   // segments per ffmpeg batch (~64s ≈ 1 min ahead)
-	WindowBack  = 3    // segments behind current request to keep cached
-	WindowAhead = 20   // segments ahead of current batch start to keep cached
+	SegDuration = 4.0 // seconds per HLS segment
+	BatchSize   = 16  // segments per ffmpeg batch (~64s ≈ 1 min ahead)
+	WindowBack  = 3   // segments behind current request to keep cached
+	WindowAhead = 20  // segments ahead of current batch start to keep cached
 	IdleTimeout = 10 * time.Minute
 	reapTick    = 30 * time.Second
 )

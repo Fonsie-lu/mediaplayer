@@ -3,11 +3,16 @@
   const mount = params.get("mount");
   const path = params.get("path");
   const video = document.getElementById("video");
+  const stage = document.getElementById("stage");
   const statusEl = document.getElementById("status");
+  const osdEl = document.getElementById("osd");
+  const helpEl = document.getElementById("help");
   const qualitySel = document.getElementById("quality");
   const audioSel = document.getElementById("audio");
   const audioItem = document.getElementById("audio-item");
   const muteBtn = document.getElementById("mute");
+  const helpBtn = document.getElementById("help-btn");
+  const helpCloseBtn = document.getElementById("help-close");
   const closeBtn = document.getElementById("close");
 
   let hls = null;
@@ -63,6 +68,18 @@
   function setStatus(msg, err) {
     statusEl.textContent = msg || "";
     statusEl.className = "status" + (err ? " err" : "");
+  }
+
+  // Transient overlay over the video. The native controls auto-hide, so a
+  // keyboard seek or volume change would otherwise have no visible effect.
+  let osdTimer = null;
+  function osd(text) {
+    osdEl.textContent = text;
+    osdEl.hidden = false;
+    clearTimeout(osdTimer);
+    osdTimer = setTimeout(() => {
+      osdEl.hidden = true;
+    }, 1100);
   }
 
   function canNativeHLS() {
@@ -295,10 +312,7 @@
   function renderMute() {
     muteIcon.textContent = video.muted ? "🔇" : "🔊";
   }
-  muteBtn.addEventListener("click", () => {
-    video.muted = !video.muted;
-    renderMute();
-  });
+  muteBtn.addEventListener("click", () => toggleMute());
   video.addEventListener("volumechange", renderMute);
   renderMute();
 
@@ -311,61 +325,196 @@
     } catch (_) {}
   });
 
-  // Close keys are handled in the capture phase on window so they fire no
-  // matter where focus landed — clicking the native video timeline moves focus
-  // into the controls' shadow DOM, which would otherwise swallow the keydown
-  // before the document-level handler below sees it.
-  function closeKeyHandler(ev) {
-    const tag = document.activeElement && document.activeElement.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
-    if (ev.key === "q" || ev.key === "Escape") {
+  // ---------- Actions ----------
+
+  function togglePlay() {
+    if (video.paused) {
+      video.play().catch(() => {});
+      osd("▶");
+    } else {
+      video.pause();
+      osd("⏸");
+    }
+  }
+
+  // Seeks clamp to just short of the end: landing exactly on the duration
+  // fires `ended`, which rememberPosition() reads as "finished" and wipes the
+  // resume entry.
+  function seekTo(t, label) {
+    const dur = videoDuration();
+    let to = Math.max(0, t);
+    if (dur > 0) to = Math.min(to, Math.max(0, dur - 0.5));
+    video.currentTime = to;
+    const of = dur > 0 ? ` / ${fmtTime(dur)}` : "";
+    osd(`${label} ${fmtTime(to)}${of}`);
+  }
+
+  function seekBy(delta) {
+    const sign = delta > 0 ? "+" : "−";
+    seekTo(
+      (video.currentTime || 0) + delta,
+      `${delta > 0 ? "⏩" : "⏪"} ${sign}${fmtTime(Math.abs(delta))} ·`,
+    );
+  }
+
+  function seekToFraction(f) {
+    const dur = videoDuration();
+    if (dur <= 0) return;
+    seekTo(dur * f, `${Math.round(f * 100)}% ·`);
+  }
+
+  function volumeBy(delta) {
+    const v = Math.min(1, Math.max(0, (video.volume || 0) + delta));
+    video.volume = v;
+    // Nudging the volume up while muted should be audible, not silent.
+    if (v > 0 && video.muted) video.muted = false;
+    osd(v === 0 ? "🔇 0%" : `🔊 ${Math.round(v * 100)}%`);
+  }
+
+  function toggleMute() {
+    video.muted = !video.muted;
+    renderMute();
+    osd(video.muted ? "🔇 muted" : `🔊 ${Math.round(video.volume * 100)}%`);
+  }
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+      return;
+    }
+    // Fullscreen the stage, not the video: only the fullscreen element's
+    // subtree renders, so fullscreening the bare <video> would hide the OSD
+    // and help card. iOS Safari has no element fullscreen — it only offers
+    // the video's own native fullscreen.
+    if (stage.requestFullscreen) {
+      stage.requestFullscreen().catch(() => {});
+    } else if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen();
+    }
+  }
+
+  function setHelp(open) {
+    helpEl.hidden = !open;
+  }
+
+  // ---------- Keyboard ----------
+  //
+  // One handler, on window, in the CAPTURE phase. Both parts matter:
+  //
+  //   * Capture — a click on the video (or its timeline) puts focus inside the
+  //     native controls' shadow DOM, which handles arrows/space itself and can
+  //     consume the keydown before a bubble-phase listener ever runs. Capturing
+  //     at the window means we see every key first, whatever holds focus.
+  //   * stopImmediatePropagation on keys we own — otherwise the controls also
+  //     act on them and a single press seeks twice, or `space` both toggles
+  //     play and re-clicks whichever nav button was last clicked.
+  const actions = {
+    " ": togglePlay,
+    k: () => seekBy(60),
+    j: () => seekBy(-60),
+    l: () => seekBy(5),
+    ArrowRight: () => seekBy(5),
+    h: () => seekBy(-5),
+    ArrowLeft: () => seekBy(-5),
+    ArrowUp: () => volumeBy(0.1),
+    ArrowDown: () => volumeBy(-0.1),
+    m: toggleMute,
+    f: toggleFullscreen,
+    "?": () => setHelp(helpEl.hidden),
+  };
+  for (let d = 0; d <= 9; d++) {
+    actions[String(d)] = () => seekToFraction(d / 10);
+  }
+
+  // Keys a focused <select> needs to operate itself. Everything else still
+  // reaches the player, so the shortcuts keep working after using the quality
+  // or audio dropdown — the old handler bailed out on any focused SELECT,
+  // which left the keyboard dead until the user clicked elsewhere.
+  const selectOwns = new Set([
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    " ",
+    "Enter",
+    "Escape",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+  ]);
+
+  function keyHandler(ev) {
+    // Let the browser keep its own shortcuts (ctrl+R, cmd+L, alt+←, …).
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    const el = document.activeElement;
+    const tag = el && el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || (el && el.isContentEditable)) {
+      return;
+    }
+    const isSelect = tag === "SELECT";
+    if (isSelect && selectOwns.has(ev.key)) return;
+
+    // Help is a layer on top: closing it takes priority over leaving the page.
+    if (!helpEl.hidden && (ev.key === "Escape" || ev.key === "q")) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      setHelp(false);
+      return;
+    }
+    if (
+      ev.key === "q" ||
+      (ev.key === "Escape" && !document.fullscreenElement)
+    ) {
       ev.preventDefault();
       ev.stopImmediatePropagation();
       closeAndLeave();
+      return;
     }
+    const action = actions[ev.key];
+    if (!action) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    action();
   }
-  window.addEventListener("keydown", closeKeyHandler, true);
+
+  window.addEventListener("keydown", keyHandler, true);
   // Belt-and-suspenders: also bind on the video itself in the capture phase so
   // the key is intercepted even if a browser routes it directly to the focused
   // media element before window capture (some engines do for media controls).
-  video.addEventListener("keydown", closeKeyHandler, true);
+  // Window capture runs first and stops propagation, so this never double-fires.
+  video.addEventListener("keydown", keyHandler, true);
 
-  document.addEventListener("keydown", (ev) => {
-    if (
-      ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)
-    )
-      return;
-    switch (ev.key) {
-      case " ":
-        video.paused ? video.play() : video.pause();
-        ev.preventDefault();
-        break;
-      case "m":
-        muteBtn.click();
-        break;
-      case "f":
-        if (document.fullscreenElement) document.exitFullscreen();
-        else video.requestFullscreen();
-        break;
-      case "ArrowLeft":
-      case "h":
-        video.currentTime = Math.max(0, video.currentTime - 5);
-        ev.preventDefault();
-        break;
-      case "ArrowRight":
-      case "l":
-        video.currentTime = video.currentTime + 5;
-        ev.preventDefault();
-        break;
-      case "j":
-        video.currentTime = Math.max(0, video.currentTime - 30);
-        ev.preventDefault();
-        break;
-      case "k":
-        video.currentTime = video.currentTime + 30;
-        ev.preventDefault();
-        break;
-    }
+  // Clicking the native controls (play button, timeline) puts focus inside the
+  // browser's closed user-agent shadow root, and from there keydown never
+  // reaches the page at all: not the document, not even a capture-phase
+  // listener on window. Every shortcut stays dead until focus leaves — the
+  // reason `q` and `Esc` used to stop working after touching the scrubber.
+  //
+  // No pointer event escapes that shadow root either, so `focusin` is the only
+  // signal available. Pointer-driven focus is handed straight back to the
+  // document; `:focus-visible` is true only for keyboard-driven focus, so
+  // tabbing to the video still works normally. Browsers without
+  // :focus-visible throw on matches() — treat that as "blur", which keeps the
+  // shortcuts alive at the cost of not being able to tab into the controls.
+  video.addEventListener("focusin", () => {
+    // Blurring synchronously inside the focusin dispatch has no effect — the
+    // browser is still assigning focus and simply re-applies it. Defer a tick.
+    setTimeout(() => {
+      if (document.activeElement !== video) return;
+      let keyboardDriven = false;
+      try {
+        keyboardDriven = video.matches(":focus-visible");
+      } catch (_) {}
+      if (!keyboardDriven) video.blur();
+    }, 0);
+  });
+
+  helpBtn.addEventListener("click", () => setHelp(helpEl.hidden));
+  helpCloseBtn.addEventListener("click", () => setHelp(false));
+  // Clicking the dimmed backdrop (but not the card) dismisses the help.
+  helpEl.addEventListener("click", (ev) => {
+    if (ev.target === helpEl) setHelp(false);
   });
 
   init();
