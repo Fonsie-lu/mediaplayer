@@ -14,8 +14,12 @@ type Mount struct {
 }
 
 type Config struct {
-	Host   string  `json:"host"`
-	Port   int     `json:"port"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	// Disk is the filesystem the browser's free-space widget reports on:
+	// either a device node (/dev/nvme0n1p3, resolved to its mountpoint) or a
+	// directory. Empty disables the widget.
+	Disk   string  `json:"disk"`
 	Mounts []Mount `json:"mounts"`
 
 	file string
@@ -69,6 +73,7 @@ func (c *Config) Save() error {
 type Snapshot struct {
 	Host   string  `json:"host"`
 	Port   int     `json:"port"`
+	Disk   string  `json:"disk"`
 	Mounts []Mount `json:"mounts"`
 }
 
@@ -78,6 +83,7 @@ func (c *Config) Snapshot() Snapshot {
 	return Snapshot{
 		Host:   c.Host,
 		Port:   c.Port,
+		Disk:   c.Disk,
 		Mounts: append([]Mount(nil), c.Mounts...),
 	}
 }
@@ -93,6 +99,14 @@ func (c *Config) Replace(mounts []Mount) error {
 	c.Mounts = mounts
 	c.mu.Unlock()
 	return c.Save()
+}
+
+// DiskSpec reads the one field /api/disk needs, without Snapshot's copy of the
+// whole mounts slice — the widget polls once a minute per open tab.
+func (c *Config) DiskSpec() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Disk
 }
 
 func (c *Config) MountByIndex(i int) (Mount, bool) {

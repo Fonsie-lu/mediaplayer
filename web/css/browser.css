@@ -99,14 +99,142 @@
   color: var(--blue);
 }
 
+/* Thumbnail sheet (`p`). The card never exceeds 80% of the viewport and never
+   scrolls: JS picks a tile size that makes the whole grid fit inside the box it
+   computes from those same 80%. */
+/* The single source of truth for the sheet's geometry: the rules below and
+   layoutSheet() in browser.js both read these, so the fit calculation can't
+   drift from the box it's fitting. Keep the values plain numbers or px —
+   layoutSheet parseFloat()s them straight off :root. */
+:root {
+  --sheet-pad: 12px;
+  --sheet-border: 1px;
+  --sheet-gap: 6px;
+  --sheet-head-h: 20px;
+  --sheet-fraction: 0.8; /* the card's share of the viewport */
+}
+/* Overlay geometry comes from .modal in tokyo-night.css; only the sheet's own
+   deviations live here. */
+.sheet {
+  background: rgba(0, 0, 0, 0.78);
+  z-index: 200;
+  cursor: pointer;
+}
+.sheet-card {
+  /* .sheet's pointer cursor advertises "click to close" — that's the backdrop's
+     job, not the card's. */
+  cursor: default;
+  background: var(--bg-dark);
+  border: var(--sheet-border) solid var(--border);
+  max-width: calc(var(--sheet-fraction) * 100vw);
+  max-height: calc(var(--sheet-fraction) * 100vh);
+  padding: var(--sheet-pad);
+  overflow: hidden;
+}
+.sheet-head {
+  color: var(--blue);
+  font-size: 13px;
+  font-weight: 600;
+  height: var(--sheet-head-h);
+  line-height: var(--sheet-head-h);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sheet-head .dim {
+  color: var(--comment);
+  font-weight: 500;
+}
+.sheet-grid {
+  display: grid;
+  gap: var(--sheet-gap);
+  justify-content: center;
+}
+/* Each frame is a button: clicking (or Enter on the focused one) opens the
+   video at that timestamp, so it has to read as clickable. */
+.sheet-shot {
+  position: relative;
+  background: var(--bg);
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.sheet-shot:hover,
+.sheet-shot:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+.sheet-shot:hover .t,
+.sheet-shot:focus-visible .t {
+  background: var(--blue);
+  color: var(--bg-dark);
+}
+.sheet-shot img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.sheet-shot .t {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  padding: 0 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Disk-usage readout, left of the filter. Bar and label both encode the
+   *used* fraction, so they grow together as the disk fills. */
+.disk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--comment);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.disk .disk-ic {
+  color: var(--blue);
+  font-size: 15px;
+}
+.disk .disk-bar {
+  width: 64px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-hl);
+  overflow: hidden;
+}
+.disk .disk-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--green);
+  transition: width 0.3s ease;
+}
+.disk[data-level="warn"] .disk-fill {
+  background: var(--yellow);
+}
+.disk[data-level="crit"] .disk-fill {
+  background: var(--red);
+}
+.disk[data-level="warn"] .disk-pct {
+  color: var(--yellow);
+}
+.disk[data-level="crit"] .disk-pct {
+  color: var(--red);
+}
+
 .filter {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-.filter .filter-ic {
-  color: var(--blue);
-  font-size: 18px;
 }
 .filter input {
   width: 240px;
@@ -292,5 +420,9 @@
   }
   .filter input {
     width: 140px;
+  }
+  /* keep the percentage, drop the bar — the header is tight here */
+  .disk .disk-bar {
+    display: none;
   }
 }

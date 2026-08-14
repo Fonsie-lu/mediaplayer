@@ -144,7 +144,7 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sid := h.sid(w, r)
-	dir, err := os.MkdirTemp("", "mediaplayer-sess-")
+	dir, err := os.MkdirTemp("", session.SessTempPrefix)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

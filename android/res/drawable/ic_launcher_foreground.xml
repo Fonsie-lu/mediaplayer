@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Play triangle in tokyo-night blue. Adaptive icons are masked to whatever
+     shape the launcher uses, and the outer ~18dp of the 108dp canvas can be
+     cropped, so the glyph stays well inside the safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#7aa2f7"
+        android:pathData="M43,36 L74,54 L43,72 Z" />
+</vector>

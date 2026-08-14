@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -34,6 +36,28 @@ func ensurePreviewDir() string {
 // PreviewDir returns the cache dir, or "" if it hasn't been created yet.
 func PreviewDir() string { return previewDir }
 
+// runThumbnailer is the single place that knows ffmpegthumbnailer's CLI: both
+// the cached previews here and the per-request sheet frames go through it, so
+// the flags and the "errors come back on combined stdout+stderr" behaviour
+// can't drift apart. at is an hh:mm:ss seek, or "" for the tool's own pick —
+// a bare number would be read as a *percentage* of the runtime.
+func runThumbnailer(ctx context.Context, input, out, format string, size int, at string) error {
+	args := []string{
+		"-i", input,
+		"-o", out,
+		"-s", strconv.Itoa(size),
+		"-q", "8",
+		"-c", format,
+	}
+	if at != "" {
+		args = append(args, "-t", at)
+	}
+	if b, err := exec.CommandContext(ctx, "ffmpegthumbnailer", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s", bytes.TrimSpace(b))
+	}
+	return nil
+}
+
 // ensureThumb generates the thumbnail at cachePath if missing. Concurrent
 // callers for the same path block on one generation instead of racing.
 func ensureThumb(input, cachePath string, size int) error {
@@ -50,15 +74,11 @@ func ensureThumb(input, cachePath string, size int) error {
 	if _, err := os.Stat(cachePath); err == nil {
 		return nil
 	}
-	cmd := exec.Command("ffmpegthumbnailer",
-		"-i", input,
-		"-o", cachePath,
-		"-s", strconv.Itoa(size),
-		"-q", "8",
-		"-c", "png",
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("thumbnail failed: %s", out)
+	// Deliberately not the request's context: ffmpegthumbnailer writes straight
+	// into the cache path, so killing it on client abort would leave a truncated
+	// PNG that every later request treats as a cache hit.
+	if err := runThumbnailer(context.Background(), input, cachePath, "png", size, ""); err != nil {
+		return fmt.Errorf("thumbnail failed: %w", err)
 	}
 	return nil
 }

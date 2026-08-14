@@ -21,6 +21,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/rename", h.rename)
 	mux.HandleFunc("/api/delete", h.del)
 	mux.HandleFunc("/api/preview", h.preview)
+	mux.HandleFunc("/api/disk", h.disk)
+	mux.HandleFunc("/api/sheet", h.sheet)
 	mux.HandleFunc("/api/probe", h.probe)
 	mux.HandleFunc("/api/stream/direct", h.streamDirect)
 	mux.HandleFunc("/api/stream/open", h.streamOpen)

@@ -18,6 +18,7 @@ func (h *Handler) configRW(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"host":   snap.Host,
 			"port":   snap.Port,
+			"disk":   snap.Disk,
 			"mounts": snap.Mounts,
 		})
 	case http.MethodPost:

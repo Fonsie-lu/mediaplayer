@@ -13,8 +13,16 @@
         <div class="col-head col-head-mount" id="head-mount">Mount</div>
         <div class="col-head col-head-files" id="head-files">
           <div class="crumbs" id="crumbs"></div>
+          <!-- Used space on the configured disk. Hidden until /api/disk
+               returns a usable number (unset config, unmounted device, …). -->
+          <div class="disk" id="disk" hidden>
+            <span class="disk-ic" id="disk-ic"></span>
+            <span class="disk-bar"
+              ><span class="disk-fill" id="disk-fill"></span
+            ></span>
+            <span class="disk-pct" id="disk-pct"></span>
+          </div>
           <div class="filter" id="filter" hidden>
-            <span class="filter-ic">⌕</span>
             <input id="filter-input" type="text" placeholder="filter…" />
           </div>
         </div>
@@ -54,11 +62,22 @@
           <button data-act="sort" title="sort">⇅</button>
           <button data-act="filter" title="filter">⌕</button>
           <button data-act="rename" title="rename">✎</button>
+          <button data-act="unpart" title="strip .part">✂</button>
+          <button data-act="sheet" title="thumbnail sheet">▦</button>
           <button data-act="delete" title="delete">✖</button>
         </nav>
       </div>
 
       <footer class="statusbar" id="statusbar"></footer>
+    </div>
+
+    <!-- Thumbnail sheet: capped at 80% of the viewport, tiles are sized in JS
+         so the whole grid fits without scrolling. Closes on any input. -->
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet-card" id="sheet-card">
+        <div class="sheet-head" id="sheet-head"></div>
+        <div class="sheet-grid" id="sheet-grid"></div>
+      </div>
     </div>
 
     <!-- Modals -->

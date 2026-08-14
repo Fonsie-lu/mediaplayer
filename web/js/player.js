@@ -41,6 +41,21 @@
     const e = loadResumeMap()[resumeId];
     return e && e.t > 0 ? e.t : 0;
   }
+  // `?t=` in the *page* URL (the browser page's thumbnail sheet links every
+  // frame with one) is an explicit "start here" and outranks the stored resume
+  // position. Unrelated to the legacy `t` on /api/stream/open, which the server
+  // ignores — this one never leaves the client.
+  function requestedStart() {
+    const t = parseFloat(params.get("t"));
+    return isFinite(t) && t > 0 ? t : 0;
+  }
+  function initialStart() {
+    return requestedStart() || storedResume();
+  }
+  // How the status line describes a non-zero start. Only the first play() can
+  // be a `?t=` jump; the later ones (quality / audio switches) pick up the live
+  // playhead, which is a resume in every sense.
+  let startLabel = requestedStart() ? "from" : "resumed";
   // Records the playhead; positions near the start or end clear the entry
   // so finished videos restart from the beginning next time.
   function rememberPosition(t, dur) {
@@ -101,7 +116,8 @@
     currentQuality = qualitySel.value;
     currentAudio = probe.preferred_audio || 0;
     renderAudioTracks();
-    await play(storedResume());
+    await play(initialStart());
+    startLabel = "resumed";
   }
 
   function trackLabel(t) {
@@ -139,7 +155,8 @@
 
   async function play(startSec) {
     tearDown();
-    const resumeNote = startSec > 0 ? ` · resumed ${fmtTime(startSec)}` : "";
+    const resumeNote =
+      startSec > 0 ? ` · ${startLabel} ${fmtTime(startSec)}` : "";
     const wantDirect =
       probe.direct &&
       (currentQuality === "source" || currentQuality === "auto") &&

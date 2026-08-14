@@ -39,6 +39,19 @@ window.api = {
     if (size) q.set("size", String(size));
     return "/api/preview?" + q;
   },
+  // mount/path are optional: with them the server reports the filesystem the
+  // browsed directory lives on, without them the one named in the config.
+  disk(mount, path) {
+    if (mount == null) return this.json("/api/disk");
+    const q = new URLSearchParams({ mount: String(mount), path: path || "" });
+    return this.json("/api/disk?" + q);
+  },
+  // signal is worth passing: the handler wires the request context into its
+  // ffmpegthumbnailer processes, so aborting actually stops the work.
+  sheet(mount, path, signal) {
+    const q = new URLSearchParams({ mount: String(mount), path });
+    return this.json("/api/sheet?" + q, { signal });
+  },
   probe(mount, path) {
     const q = new URLSearchParams({ mount: String(mount), path });
     return this.json("/api/probe?" + q);

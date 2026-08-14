@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -490,8 +491,22 @@ func (s *Session) shutdown() {
 	}
 }
 
-// CleanStaleTempDirs removes leftover mediaplayer-sess-* directories from
-// previous runs (e.g. after a crash or kill -9 of the server itself).
+// Temp-dir prefixes this process owns and normally removes itself. The
+// creators live in internal/api, but the startup janitor below is the reason
+// they have to be named at all, so the constants live with it — use these in
+// os.MkdirTemp rather than repeating the literal, or a rename silently orphans
+// the dirs instead of failing to compile.
+const (
+	SessTempPrefix  = "mediaplayer-sess-"  // per-session HLS segment dir
+	SheetTempPrefix = "mediaplayer-sheet-" // per-/api/sheet-request frame scratch
+)
+
+// staleTempPrefixes is what CleanStaleTempDirs matches. The stable preview
+// cache is deliberately absent — it is meant to survive restarts.
+var staleTempPrefixes = []string{SessTempPrefix, SheetTempPrefix}
+
+// CleanStaleTempDirs removes leftovers matching staleTempPrefixes from previous
+// runs (e.g. after a crash or kill -9 of the server itself).
 // Call once at startup.
 func CleanStaleTempDirs() {
 	entries, err := os.ReadDir(os.TempDir())
@@ -499,14 +514,16 @@ func CleanStaleTempDirs() {
 		return
 	}
 	for _, e := range entries {
-		if !e.IsDir() || !strings.HasPrefix(e.Name(), "mediaplayer-sess-") {
+		if !e.IsDir() || !slices.ContainsFunc(staleTempPrefixes, func(p string) bool {
+			return strings.HasPrefix(e.Name(), p)
+		}) {
 			continue
 		}
 		full := filepath.Join(os.TempDir(), e.Name())
 		if err := os.RemoveAll(full); err != nil {
 			log.Printf("stale cleanup: %v", err)
 		} else {
-			log.Printf("removed stale session dir: %s", full)
+			log.Printf("removed stale temp dir: %s", full)
 		}
 	}
 }
