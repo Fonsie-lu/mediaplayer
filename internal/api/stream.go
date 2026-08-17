@@ -179,7 +179,7 @@ func (h *Handler) streamClose(w http.ResponseWriter, r *http.Request) {
 	sid := h.sid(w, r)
 	h.Sessions.Close(sid)
 	log.Printf("[session %s] closed", sid)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeOK(w)
 }
 
 // streamHLS handles both the playlist and the segments under
@@ -212,14 +212,9 @@ func (h *Handler) streamHLS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !strings.HasPrefix(file, "seg_") || !strings.HasSuffix(file, ".ts") {
-		writeErr(w, http.StatusBadRequest, "bad file")
-		return
-	}
-	idxStr := strings.TrimSuffix(strings.TrimPrefix(file, "seg_"), ".ts")
-	n, err := strconv.Atoi(idxStr)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad segment index")
+	n, ok := transcode.ParseSegName(file)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "bad segment name")
 		return
 	}
 	path, err := sess.EnsureSegment(r.Context(), n)

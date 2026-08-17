@@ -2,21 +2,16 @@ package transcode
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // keyframeCache memoizes keyframe scans the same way probeCache does — the
 // scan demuxes every packet header, which can take seconds on large files
 // over network mounts, and the result is tiny (one float per GOP).
-var keyframeCache = struct {
-	sync.Mutex
-	m map[string][]float64
-}{m: map[string][]float64{}}
+var keyframeCache = newLRU[[]float64](keyframeCacheMax)
 
 const keyframeCacheMax = 128
 
@@ -25,15 +20,9 @@ const keyframeCacheMax = 128
 // keyframes, so the playlist must be built from real keyframe positions
 // instead of a fixed segment-duration grid.
 func KeyframeTimes(path string) ([]float64, error) {
-	var key string
-	if st, err := os.Stat(path); err == nil {
-		key = path + "|" + strconv.FormatInt(st.Size(), 10) + "|" + strconv.FormatInt(st.ModTime().UnixNano(), 10)
-		keyframeCache.Lock()
-		cached := keyframeCache.m[key]
-		keyframeCache.Unlock()
-		if cached != nil {
-			return cached, nil
-		}
+	key := statKey(path)
+	if cached, ok := keyframeCache.get(key); ok {
+		return cached, nil
 	}
 	cmd := exec.Command("ffprobe",
 		"-v", "error",
@@ -47,14 +36,7 @@ func KeyframeTimes(path string) ([]float64, error) {
 		return nil, fmt.Errorf("keyframe scan: %w", err)
 	}
 	times := parseKeyframeCSV(string(out))
-	if key != "" {
-		keyframeCache.Lock()
-		if len(keyframeCache.m) >= keyframeCacheMax {
-			keyframeCache.m = map[string][]float64{}
-		}
-		keyframeCache.m[key] = times
-		keyframeCache.Unlock()
-	}
+	keyframeCache.put(key, times)
 	return times, nil
 }
 

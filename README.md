@@ -140,21 +140,23 @@ seconds for a feature-length recording).
 **Every frame is clickable**: it opens the video in the player starting at that
 frame's timestamp, so the sheet doubles as a visual seek bar. The keyboard works
 too — `Tab` / `Shift+Tab` step between frames and `Enter` plays the focused one.
-Clicking outside the sheet or pressing `Esc` closes it; any other key is ignored
-while it's open, so nothing acts on the file list hidden behind it.
+Clicking outside the sheet or pressing `Esc` or `q` closes it; any other key is
+ignored while it's open, so nothing acts on the file list hidden behind it.
 
 | Key / action        | Effect                                    |
 | ------------------- | ----------------------------------------- |
 | Click a frame       | Play from that timestamp                  |
 | `Tab` / `Shift+Tab` | Move between frames                       |
 | `Enter` / `Space`   | Play the focused frame                    |
+| `q`                 | Close (rendered sheet only)               |
 | Click outside       | Close                                     |
 | `Esc`               | Close (or cancel a sheet still rendering) |
 
 `Backspace` renames `something.mp4.part` to `something.mp4` in place. It refuses
 when `something.mp4` already exists, so an interrupted download can't overwrite
 the finished file. It does not go up a directory — `h` / `←` do that — and it is
-deliberately not `q`, which the player page uses to close and return here.
+deliberately not `q`: that key closes the player page and the thumbnail sheet, so
+it never mutates a file.
 
 **Sort shortcuts** (no dialog — capital letter reverses direction)
 

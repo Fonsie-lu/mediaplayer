@@ -2,11 +2,9 @@ package transcode
 
 import (
 	"encoding/json"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 type AudioTrack struct {
@@ -68,36 +66,20 @@ var directACodecs = map[string]bool{
 // probeCache memoizes ffprobe results keyed by path + size + mtime. The
 // player page probes a file and then opens a stream within the same second,
 // which would otherwise run ffprobe twice on every video open.
-var probeCache = struct {
-	sync.Mutex
-	m map[string]*ProbeResult
-}{m: map[string]*ProbeResult{}}
+var probeCache = newLRU[*ProbeResult](probeCacheMax)
 
 const probeCacheMax = 512
 
 func Probe(path string) (*ProbeResult, error) {
-	var key string
-	if st, err := os.Stat(path); err == nil {
-		key = path + "|" + strconv.FormatInt(st.Size(), 10) + "|" + strconv.FormatInt(st.ModTime().UnixNano(), 10)
-		probeCache.Lock()
-		cached := probeCache.m[key]
-		probeCache.Unlock()
-		if cached != nil {
-			return cached, nil
-		}
+	key := statKey(path)
+	if cached, ok := probeCache.get(key); ok {
+		return cached, nil
 	}
 	r, err := probeUncached(path)
 	if err != nil {
 		return nil, err
 	}
-	if key != "" {
-		probeCache.Lock()
-		if len(probeCache.m) >= probeCacheMax {
-			probeCache.m = map[string]*ProbeResult{}
-		}
-		probeCache.m[key] = r
-		probeCache.Unlock()
-	}
+	probeCache.put(key, r)
 	return r, nil
 }
 

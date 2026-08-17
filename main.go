@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -27,30 +26,19 @@ import (
 //go:embed all:web
 var webFS embed.FS
 
-// defaultConfigPath returns ~/.config/mediaplayer.json (via os.UserConfigDir,
-// so XDG_CONFIG_HOME is honored), falling back to the working directory when
-// no home is resolvable.
-func defaultConfigPath() string {
+// configPath returns name under ~/.config (via os.UserConfigDir, so
+// XDG_CONFIG_HOME is honored), falling back to the working directory when no
+// home is resolvable.
+func configPath(name string) string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
-		return "mediaplayer.json"
+		return name
 	}
-	return filepath.Join(dir, "mediaplayer.json")
-}
-
-// defaultStarsPath returns ~/.config/mediaplayer-stars.json (via
-// os.UserConfigDir, so XDG_CONFIG_HOME is honored), falling back to the working
-// directory when no home is resolvable.
-func defaultStarsPath() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "mediaplayer-stars.json"
-	}
-	return filepath.Join(dir, "mediaplayer-stars.json")
+	return filepath.Join(dir, name)
 }
 
 func main() {
-	cfgPath := flag.String("config", defaultConfigPath(), "path to config.json")
+	cfgPath := flag.String("config", configPath("mediaplayer.json"), "path to config.json")
 	noTUI := flag.Bool("no-tui", false, "run headless (no terminal UI even on a TTY)")
 	flag.Parse()
 
@@ -76,7 +64,7 @@ func main() {
 	mgr.StartReaper()
 
 	// Starred entries persist to ~/.config/mediaplayer-stars.json.
-	stars, err := api.NewStarStore(defaultStarsPath())
+	stars, err := api.NewStarStore(configPath("mediaplayer-stars.json"), cfg)
 	if err != nil {
 		log.Fatalf("stars: %v", err)
 	}
@@ -91,23 +79,21 @@ func main() {
 		log.Fatalf("embed: %v", err)
 	}
 	fileServer := http.FileServer(http.FS(web))
+	// Two pages, not a SPA (spec): /player is its own URL so browser back
+	// returns to the file browser. Both are served by rewriting to the
+	// embedded file rather than redirecting, which would show .html in the bar.
+	pages := map[string]string{"/": "/browser.html", "/player": "/player.html"}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
+		if page, ok := pages[r.URL.Path]; ok {
 			r2 := *r
-			r2.URL.Path = "/browser.html"
-			fileServer.ServeHTTP(w, &r2)
-			return
-		}
-		if r.URL.Path == "/player" {
-			r2 := *r
-			r2.URL.Path = "/player.html"
+			r2.URL.Path = page
 			fileServer.ServeHTTP(w, &r2)
 			return
 		}
 		fileServer.ServeHTTP(w, r)
 	})
 
-	addr := cfg.Host + ":" + strconv.Itoa(cfg.Port)
+	addr := cfg.Addr()
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,

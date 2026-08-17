@@ -110,10 +110,10 @@ func TestSafeJoinSymlinks(t *testing.T) {
 }
 
 func TestResolveMount(t *testing.T) {
-	cfg := &config.Config{Mounts: []config.Mount{
+	cfg := config.New(config.Snapshot{Mounts: []config.Mount{
 		{Name: "movies", Path: "/srv/movies"},
 		{Name: "tv", Path: "/srv/tv"},
-	}}
+	}})
 
 	if m, err := resolveMount(cfg, "0"); err != nil || m.Name != "movies" {
 		t.Errorf("by index 0: got %v, %v", m, err)

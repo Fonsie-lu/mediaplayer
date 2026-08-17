@@ -15,6 +15,35 @@ import (
 	"time"
 )
 
+// SegPattern is the segment filename format: ffmpeg's output pattern, the
+// name the session checks for completeness, and the name the HLS handler
+// parses back are all this one format. It lives here because transcode is the
+// package the others import, and a literal repeated in three packages would
+// let a rename silently produce segments nobody looks for (the same reasoning
+// as session.SessTempPrefix) instead of failing to compile.
+const SegPattern = "seg_%05d.ts"
+
+const segPrefix, segSuffix = "seg_", ".ts"
+
+// SegName is the on-disk filename of segment n.
+func SegName(n int) string { return fmt.Sprintf(SegPattern, n) }
+
+// ParseSegName is SegName's inverse, reporting false for anything that isn't a
+// segment filename.
+func ParseSegName(name string) (int, bool) {
+	if !strings.HasPrefix(name, segPrefix) || !strings.HasSuffix(name, segSuffix) {
+		return 0, false
+	}
+	// Atoi accepts a leading "-", so reject negatives explicitly: this is the
+	// gate an untrusted URL path segment passes through, and a negative index
+	// should read as "not a segment name" rather than reach a range check.
+	n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, segPrefix), segSuffix))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // Batch is a short-lived ffmpeg invocation that emits a contiguous range of
 // HLS segments [StartSeg, StartSeg+Count). Each batch covers ~1 min of
 // video — when the client seeks elsewhere, the running batch is stopped and
@@ -67,77 +96,82 @@ type BatchSpec struct {
 	SplitTimes []float64
 }
 
-// StartBatch spawns ffmpeg to produce segments seg_<StartSeg>..seg_<StartSeg+Count-1>
-// in spec.Dir. Each segment's PTS is offset by StartSec so that segments
-// produced by different batches share a single global timeline (no
-// EXT-X-DISCONTINUITY needed at batch boundaries).
+// batchPlan is everything StartBatch decides before it can build an ffmpeg
+// command line: where to seek, where the content that seek reaches actually
+// begins, and how much of it must be trimmed back off.
 //
-// `-ss` is given as an input option with default accurate-seek, so the first
-// frame produced corresponds exactly to source second StartSec. In remux
-// mode StartSec is itself a keyframe timestamp, so the copied stream starts
-// exactly there.
+// Splitting it out is what makes the command line testable — planning needs
+// ffmpeg probes against a real file, building the args from a plan needs
+// nothing at all.
+type batchPlan struct {
+	// seekAt is the -ss value: StartSec, or earlier when the landing overshot.
+	seekAt float64
+	// anchor (remux) is the PTS of the first packet ffmpeg copies. Segment
+	// split times are measured from it, since that is where the muxer starts
+	// counting.
+	anchor float64
+	// backoff (encode) is how many seconds before StartSec decoding begins, to
+	// be cut back off by the trim filter.
+	backoff float64
+}
+
+// planBatch decides the seek correction for spec by probing the input.
 //
-// In encode mode `-force_key_frames` ensures every segment begins with an
-// IDR frame, which HLS requires for independent decoding. In copy mode the
-// muxer splits at the source's own keyframes — the same boundaries the
-// session's playlist was built from.
-func StartBatch(spec BatchSpec) (*Batch, error) {
-	if err := os.MkdirAll(spec.Dir, 0o755); err != nil {
-		return nil, err
-	}
-	segPattern := filepath.Join(spec.Dir, "seg_%05d.ts")
-	// internal playlist file ffmpeg insists on writing — we ignore it and
-	// generate our own VOD playlist from session metadata instead.
-	internalPlaylist := filepath.Join(spec.Dir, ".batch.m3u8")
-
-	// Where -ss points and where the batch's content actually begins.
-	// Containers with a real keyframe index (matroska cues, mp4 stss) seek to
-	// a keyframe at or before the target. Index-less containers (mpegts DVB
-	// recordings) binary-search to a byte position, and usable content only
-	// begins at the next keyframe — possibly seconds *after* the target. A
-	// batch whose first segment is missing its head leaves a buffer hole at
-	// the player's seek position that no amount of fetching can fill: hls.js
-	// backtracks to n-1, whose own batch has the same defect, and stalls.
-	// When the landing overshoots, back the seek off until content starts at
-	// or before StartSec; each mode then reconciles the early start exactly.
-	seekAt := spec.StartSec
-	anchor := spec.StartSec // remux: PTS of the first packet ffmpeg copies
-	backoff := 0.0          // encode: seconds decoded then trimmed before StartSec
-
+// Where -ss lands is container-dependent. Containers with a real keyframe
+// index (matroska cues, mp4 stss) seek to a keyframe at or before the target.
+// Index-less containers (mpegts DVB recordings) binary-search to a byte
+// position, and usable content only begins at the next keyframe — possibly
+// seconds *after* the target. A batch whose first segment is missing its head
+// leaves a buffer hole at the player's seek position that no amount of
+// fetching can fill: hls.js backtracks to n-1, whose own batch has the same
+// defect, and stalls. When the landing overshoots, back the seek off until
+// content starts at or before StartSec; each mode then reconciles the early
+// start exactly (see batchArgs).
+//
+// The two modes differ only in how they probe (a copy replay vs a keyframe
+// scan) and in how they reconcile the early start, so the back-off walk itself
+// is shared — see correctSeek. Both probes are best-effort: on error the plan
+// is the uncorrected seek.
+func planBatch(spec BatchSpec) batchPlan {
+	p := batchPlan{seekAt: spec.StartSec, anchor: spec.StartSec}
 	if spec.CopyVideo {
-		if l, err := probeLanding(spec.Input, spec.Dir, seekAt); err == nil {
-			for tries := 0; l > spec.StartSec+0.05 && seekAt > 0 && tries < 3; tries++ {
-				seekAt = math.Max(0, seekAt-(l-spec.StartSec)-2.0)
-				nl, nerr := probeLanding(spec.Input, spec.Dir, seekAt)
-				if nerr != nil {
-					break
-				}
-				l = nl
-			}
-			if l > spec.StartSec+0.05 {
+		if s, l, ok := correctSeek(spec.StartSec, func(at float64) (float64, error) {
+			return probeLanding(spec.Input, spec.Dir, at)
+		}); ok {
+			p.seekAt = s
+			if l > spec.StartSec+landingSlop {
 				log.Printf("remux batch [%d..]: copy seek lands at %.2fs, after segment start %.2fs — first segment will be short",
 					spec.StartSeg, l, spec.StartSec)
 			}
-			anchor = l
+			p.anchor = l
 		}
-	} else if spec.StartSec > 0 {
-		if kf, err := keyframeLanding(spec.Input, seekAt); err == nil && kf > spec.StartSec+0.05 {
-			l := kf
-			for tries := 0; l > spec.StartSec+0.05 && seekAt > 0 && tries < 3; tries++ {
-				seekAt = math.Max(0, seekAt-(l-spec.StartSec)-2.0)
-				nl, nerr := keyframeLanding(spec.Input, seekAt)
-				if nerr != nil {
-					break
-				}
-				l = nl
-			}
-			if l > spec.StartSec+0.05 {
+		return p
+	}
+	if spec.StartSec > 0 {
+		if s, l, ok := correctSeek(spec.StartSec, func(at float64) (float64, error) {
+			return keyframeLanding(spec.Input, at)
+		}); ok {
+			p.seekAt = s
+			if l > spec.StartSec+landingSlop {
 				log.Printf("encode batch [%d..]: no keyframe at or before segment start %.2fs (decode starts %.2fs) — first segment will be short",
 					spec.StartSeg, spec.StartSec, l)
 			}
-			backoff = spec.StartSec - seekAt
+			p.backoff = spec.StartSec - p.seekAt
 		}
 	}
+	return p
+}
+
+// batchArgs builds ffmpeg's full argument list for spec under plan. Pure: no
+// filesystem access, no subprocesses — the streaming path's trickiest logic
+// (which muxer, what gets copied, how the timeline is rebased) reduced to a
+// value a test can assert on.
+func batchArgs(spec BatchSpec, plan batchPlan) []string {
+	segPattern := filepath.Join(spec.Dir, SegPattern)
+	// internal playlist file ffmpeg insists on writing — we ignore it and
+	// generate our own VOD playlist from session metadata instead.
+	internalPlaylist := filepath.Join(spec.Dir, ".batch.m3u8")
+	seekAt, anchor, backoff := plan.seekAt, plan.anchor, plan.backoff
 
 	args := []string{
 		"-hide_banner",
@@ -264,6 +298,32 @@ func StartBatch(spec BatchSpec) (*Batch, error) {
 			internalPlaylist,
 		)
 	}
+	return args
+}
+
+// StartBatch spawns ffmpeg to produce segments seg_<StartSeg>..seg_<StartSeg+Count-1>
+// in spec.Dir. Each segment's PTS is offset by StartSec so that segments
+// produced by different batches share a single global timeline (no
+// EXT-X-DISCONTINUITY needed at batch boundaries).
+//
+// `-ss` is given as an input option with default accurate-seek, so the first
+// frame produced corresponds exactly to source second StartSec. In remux
+// mode StartSec is itself a keyframe timestamp, so the copied stream starts
+// exactly there.
+//
+// In encode mode `-force_key_frames` ensures every segment begins with an
+// IDR frame, which HLS requires for independent decoding. In copy mode the
+// muxer splits at the source's own keyframes — the same boundaries the
+// session's playlist was built from.
+//
+// The work is three steps: planBatch probes where the seek lands, batchArgs
+// turns spec+plan into a command line (pure, so it is the tested part), and
+// this function spawns it and watches the process.
+func StartBatch(spec BatchSpec) (*Batch, error) {
+	if err := os.MkdirAll(spec.Dir, 0o755); err != nil {
+		return nil, err
+	}
+	args := batchArgs(spec, planBatch(spec))
 
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -302,6 +362,46 @@ func StartBatch(spec BatchSpec) (*Batch, error) {
 		close(b.done)
 	}()
 	return b, nil
+}
+
+const (
+	// landingSlop is how far past a segment's start a probed landing may sit
+	// before it counts as an overshoot — a keyframe a few ms late leaves no
+	// hole worth re-probing for.
+	landingSlop = 0.05
+	// maxSeekTries bounds the back-off walk: each try costs a probe, and a
+	// container that hasn't converged by then won't with more attempts.
+	maxSeekTries = 3
+)
+
+// correctSeek walks a seek position backwards until the content it lands on
+// starts at or before want, returning the corrected position and where the
+// last probe landed. probe reports the source time at which a seek to a given
+// position actually begins producing usable content; both modes have one (a
+// 1-frame copy replay for remux, a keyframe scan for encode) and the walk is
+// identical, so only the probe differs.
+//
+// ok is false when the first probe fails — best-effort by design, the caller
+// then proceeds with the uncorrected seek. A returned landing still after want
+// means the walk gave up; the caller decides what to do about the short first
+// segment.
+func correctSeek(want float64, probe func(float64) (float64, error)) (seekAt, landing float64, ok bool) {
+	seekAt = want
+	l, err := probe(seekAt)
+	if err != nil {
+		return want, 0, false
+	}
+	// Overshoot by (l-want) plus 2s of slack, since the next keyframe back is
+	// an unknown distance earlier.
+	for tries := 0; l > want+landingSlop && seekAt > 0 && tries < maxSeekTries; tries++ {
+		seekAt = math.Max(0, seekAt-(l-want)-2.0)
+		nl, nerr := probe(seekAt)
+		if nerr != nil {
+			break
+		}
+		l = nl
+	}
+	return seekAt, l, true
 }
 
 // probeLanding reports the PTS of the keyframe a stream-copy `-ss target`
@@ -371,7 +471,7 @@ func keyframeLanding(input string, target float64) (float64, error) {
 // abnormally, since its newest file may be truncated mid-write.
 func (b *Batch) removeNewestSegment() {
 	for n := b.StartSeg + b.Count - 1; n >= b.StartSeg; n-- {
-		p := filepath.Join(b.Dir, fmt.Sprintf("seg_%05d.ts", n))
+		p := filepath.Join(b.Dir, SegName(n))
 		if _, err := os.Stat(p); err == nil {
 			_ = os.Remove(p)
 			return

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,13 +14,8 @@ type renameReq struct {
 }
 
 func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "POST required")
-		return
-	}
 	var req renameReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+	if !decodePost(w, r, &req) {
 		return
 	}
 	if strings.ContainsAny(req.NewName, "/\\") || req.NewName == "" || req.NewName == "." || req.NewName == ".." {
@@ -42,7 +36,7 @@ func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeOK(w)
 }
 
 type deleteReq struct {
@@ -51,13 +45,8 @@ type deleteReq struct {
 }
 
 func (h *Handler) del(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "POST required")
-		return
-	}
 	var req deleteReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+	if !decodePost(w, r, &req) {
 		return
 	}
 	mount, full, ok := h.target(w, req.Mount, req.Path)
@@ -73,5 +62,5 @@ func (h *Handler) del(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeOK(w)
 }

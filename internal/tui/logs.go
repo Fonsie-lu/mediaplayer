@@ -75,19 +75,11 @@ func (m *Model) rebuildLogRows() {
 
 func (m Model) updateLogs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	n := len(m.logRows)
+	if sel, ok := listNav(msg.String(), m.lSel, n); ok {
+		m.lSel = sel
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.lSel < n-1 {
-			m.lSel++
-		}
-	case "k", "up":
-		if m.lSel > 0 {
-			m.lSel--
-		}
-	case "g", "home":
-		m.lSel = 0
-	case "G", "end":
-		m.lSel = max(0, n-1)
 	case "ctrl+d":
 		m.lSel = min(n-1, m.lSel+m.contentHeight()/2)
 	case "ctrl+u":
@@ -99,19 +91,9 @@ func (m Model) updateLogs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "space", "o":
 		m.toggleAtSel()
 	case "E":
-		for _, r := range m.logRows {
-			if r.header {
-				m.collapsed[r.key] = false
-			}
-		}
-		m.rebuildLogRows()
+		m.setAllCollapsed(false)
 	case "C":
-		for _, r := range m.logRows {
-			if r.header {
-				m.collapsed[r.key] = true
-			}
-		}
-		m.rebuildLogRows()
+		m.setAllCollapsed(true)
 	case "c":
 		m.logs.Clear()
 		m.logVersion = m.logs.Version()
@@ -134,6 +116,16 @@ func (m Model) selKey() (string, int, bool) {
 		}
 	}
 	return key, -1, false
+}
+
+// setAllCollapsed collapses or expands every group at once (C / E).
+func (m *Model) setAllCollapsed(v bool) {
+	for _, r := range m.logRows {
+		if r.header {
+			m.collapsed[r.key] = v
+		}
+	}
+	m.rebuildLogRows()
 }
 
 func (m *Model) setCollapsedAtSel(v bool) {

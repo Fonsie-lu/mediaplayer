@@ -187,7 +187,7 @@
             : currentQuality;
       let info;
       try {
-        info = await api.openStream(mount, path, 0, q, currentAudio);
+        info = await api.openStream(mount, path, q, currentAudio);
       } catch (e) {
         setStatus("open stream failed: " + e.message, true);
         return;

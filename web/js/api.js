@@ -9,6 +9,15 @@ window.api = {
     if (!r.ok) throw new Error((data && data.error) || r.statusText);
     return data;
   },
+  // post is every mutating endpoint's shape: JSON body, JSON reply. The four
+  // callers below differ only in URL and payload.
+  post(url, body) {
+    return this.json(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  },
   mounts() {
     return this.json("/api/mounts");
   },
@@ -21,18 +30,14 @@ window.api = {
     return this.json("/api/browse?" + q);
   },
   rename(mount, path, newName) {
-    return this.json("/api/rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mount: String(mount), path, new_name: newName }),
+    return this.post("/api/rename", {
+      mount: String(mount),
+      path,
+      new_name: newName,
     });
   },
   del(mount, path) {
-    return this.json("/api/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mount: String(mount), path }),
-    });
+    return this.post("/api/delete", { mount: String(mount), path });
   },
   previewURL(mount, path, size) {
     const q = new URLSearchParams({ mount: String(mount), path });
@@ -60,13 +65,11 @@ window.api = {
     const q = new URLSearchParams({ mount: String(mount), path });
     return "/api/stream/direct?" + q;
   },
-  openStream(mount, path, t, q, audio) {
-    const p = new URLSearchParams({
-      mount: String(mount),
-      path,
-      t: String(t || 0),
-      q: q || "",
-    });
+  // No start offset: the playlist covers the whole video, so the client seeks
+  // with standard HLS instead of asking the server to spawn at an offset. (The
+  // `t` on the /player *page* URL is unrelated and never reaches the server.)
+  openStream(mount, path, q, audio) {
+    const p = new URLSearchParams({ mount: String(mount), path, q: q || "" });
     if (audio != null) p.set("audio", String(audio));
     return this.json("/api/stream/open?" + p);
   },
@@ -77,21 +80,13 @@ window.api = {
     return this.json("/api/stars");
   },
   toggleStar(mount, path) {
-    return this.json("/api/stars/toggle", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mount: String(mount), path }),
-    });
+    return this.post("/api/stars/toggle", { mount: String(mount), path });
   },
   getConfig() {
     return this.json("/api/config");
   },
   saveConfig(cfg) {
-    return this.json("/api/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(cfg),
-    });
+    return this.post("/api/config", cfg);
   },
 };
 

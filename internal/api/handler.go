@@ -44,3 +44,22 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
+
+// writeOK is the bare acknowledgement the mutating endpoints share.
+func writeOK(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// decodePost enforces POST and decodes the JSON body into v, writing the error
+// response itself. Callers must return immediately when ok is false.
+func decodePost(w http.ResponseWriter, r *http.Request, v any) (ok bool) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST required")
+		return false
+	}
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	return true
+}

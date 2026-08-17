@@ -8,19 +8,11 @@ import (
 )
 
 func (m Model) updateStars(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if sel, ok := listNav(msg.String(), m.sSel, len(m.starItems)); ok {
+		m.sSel = sel
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.sSel < len(m.starItems)-1 {
-			m.sSel++
-		}
-	case "k", "up":
-		if m.sSel > 0 {
-			m.sSel--
-		}
-	case "g", "home":
-		m.sSel = 0
-	case "G", "end":
-		m.sSel = max(0, len(m.starItems)-1)
 	case "d", "x", "u":
 		if len(m.starItems) > 0 {
 			it := m.starItems[m.sSel]
@@ -45,17 +37,21 @@ func (m Model) doUnstar() Model {
 	return m
 }
 
-// mountLabel resolves a star's mount index to its configured name when possible.
-func (m Model) mountLabel(idx string) string {
+// mountLabel labels a star's mount. Stars are keyed by mount name, so the label
+// is that name — flagged when no configured mount carries it any more, which is
+// the one case the user needs to see (the star can still be removed, it just
+// points nowhere).
+func (m Model) mountLabel(name string) string {
 	mounts := m.mounts
 	if len(mounts) == 0 {
 		mounts = m.cfg.Snapshot().Mounts
 	}
-	var i int
-	if _, err := fmt.Sscanf(idx, "%d", &i); err == nil && i >= 0 && i < len(mounts) {
-		return mounts[i].Name
+	for _, mt := range mounts {
+		if mt.Name == name {
+			return name
+		}
 	}
-	return "mount " + idx
+	return name + " (no such mount)"
 }
 
 func (m Model) viewStars() string {

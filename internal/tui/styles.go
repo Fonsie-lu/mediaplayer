@@ -8,7 +8,6 @@ var (
 	colDim    = lipgloss.Color("#565f89")
 	colAccent = lipgloss.Color("#7aa2f7")
 	colGreen  = lipgloss.Color("#9ece6a")
-	colRed    = lipgloss.Color("#f7768e")
 	colYellow = lipgloss.Color("#e0af68")
 	colMag    = lipgloss.Color("#bb9af7")
 	colSelBg  = lipgloss.Color("#283457")
@@ -28,7 +27,6 @@ var (
 	countStyle = lipgloss.NewStyle().Foreground(colYellow)
 	greenStyle = lipgloss.NewStyle().Foreground(colGreen)
 	magStyle   = lipgloss.NewStyle().Foreground(colMag)
-	redStyle   = lipgloss.NewStyle().Foreground(colRed)
 
 	helpStyle = lipgloss.NewStyle().Foreground(colDim).Padding(1, 0, 0, 0)
 

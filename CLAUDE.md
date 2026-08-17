@@ -14,13 +14,24 @@ go test -v -run TestName ./...          # single test
 ./mediaplayer                           # default config ~/.config/mediaplayer.json (XDG_CONFIG_HOME honored)
 ./mediaplayer -config /path/config.json # alternate config
 ./mediaplayer -no-tui                   # headless even on a TTY
+./android/build.sh                      # writes ./mediaplayer.apk (JDK + Android SDK, no Gradle)
+make check                              # the CI gate: fmt-check + vet + lint (staticcheck) + test -race
+make lint                               # go tool staticcheck ./...  (pinned in go.mod's tool block)
+make race                               # go test -race ./...
+make e2e                                # browser-driven checks (needs chromium + node + ffmpeg)
 ```
 
 For manual verification of a streaming change, run headless against a scratch config: `./mediaplayer -config /tmp/scratch.json -no-tui`. Headless is the point — with the TUI up, `log` output is redirected into the in-memory ring buffer and you have to hunt it in the Logs tab; headless leaves ffmpeg's per-batch lines on stderr where a `tee`/`grep` can reach them. A scratch config keeps the throwaway mount out of `~/.config/mediaplayer.json`, which the TUI and `/api/config` rewrite in place.
 
 First run with a config path that doesn't exist is not an error: `config.Load` writes the defaults (`0.0.0.0:8090`, no mounts, no disk) to that path and returns them, so the server comes up on an empty browser page and creates the file. Load also truncates the mounts slice to `MaxMounts` (10, the number of positional keybinds) and `filepath.Clean`s every mount path, so a trailing slash in the JSON is gone by the time any handler sees it.
 
-Tests are pure unit tests (`sortEntries`/`classify`, `safeJoin`/`resolveMount`, `NumSegments`/`PlaylistText`/boundaries, `parseKeyframeCSV`/`BuildBoundaries`/`maxGap`, `pickPreferredAudio`, `mountpointFor`/`unescapeMountField` against a table literal rather than the real `/proc/mounts`, `sheetTimes`/`hhmmss`) — none shell out to ffmpeg or read host state, so `make test` runs anywhere, including non-Linux where `statfsUsage` is the stub. The streaming path (batching, session concurrency, ffmpeg arg construction) has **no** automated coverage; verify those changes by playing a real file.
+`make check` is what CI runs (`.github/workflows/ci.yml`: the same four Go steps, plus prettier + `node --check` on `web/`, plus a javac compile of the Android activity). staticcheck is a **tool dependency** in `go.mod`, not a separate install — the `tool` directive and its indirect requirements are the only reason go.sum lists `honnef.co/go/tools`; none of it links into the binary. Keep the repo staticcheck-clean: it currently reports nothing, so any output is something you added.
+
+`make e2e` is separate from `check` on purpose — it needs chromium, node and ffmpeg, while `check` must run anywhere. See "Browser-driven tests" below.
+
+Tests are pure unit tests (`sortEntries`/`classify`, `safeJoin`/`resolveMount`, `NumSegments`/`PlaylistText`/boundaries, `parseKeyframeCSV`/`BuildBoundaries`/`maxGap`, `pickPreferredAudio`, `mountpointFor`/`unescapeMountField` against a table literal rather than the real `/proc/mounts`, `sheetTimes`/`hhmmss`, `SegName`/`ParseSegName` round-trip + rejects, `correctSeek` via a stub probe, `batchArgs` for both modes, `Session.batchSpecFor`, the `lru`/`statKey` cache, `config.Load`/`Replace`/`Snapshot`, and the star-store migration) — none shell out to ffmpeg or read host state, so `make test` runs anywhere, including non-Linux where `statfsUsage` is the stub. ffmpeg **argument construction** is now covered: `StartBatch` is split into `planBatch` (impure — probes the input) and `batchArgs(spec, plan)` (pure), and `hls_test.go` asserts the invariants that are otherwise only discoverable by watching a video stall — which muxer each mode uses, `-segment_times` measured from the landing keyframe, the encode trim ordering (`trim,setpts` before `scale`), that a backoff forces an audio re-encode, and the two different `-output_ts_offset` values. Batching and session **concurrency** still have no automated coverage beyond `-race` on what tests exist; verify those by playing a real file.
+
+`make clean` removes the Go binary and `/tmp/mediaplayer-*`; it does **not** touch the committed `mediaplayer.apk` (that's a release artifact, rebuilt only by `android/build.sh`). The `/mediaplayer` line in `.gitignore` must stay **anchored** — unanchored it also matches the Java package directory `android/src/ch/bithawk/mediaplayer/` and silently drops the Android app's source from commits.
 
 Go floor is the `go` directive in `go.mod` (1.26.0); the repo is kept `gofmt -l`-clean, and gofmt's comment-alignment rules shift between releases, so run `make fmt` after editing rather than hand-aligning trailing comments. `min`/`max` are the language builtins — `internal/tui` used to carry int-only copies that shadowed them; don't reintroduce those.
 
@@ -30,7 +41,21 @@ Go floor is the `go` directive in `go.mod` (1.26.0); the repo is kept `gofmt -l`
 - `ffprobe` — codec/container detection for direct-vs-transcode decision
 - `ffmpegthumbnailer` — 300px PNG previews
 - `hls.js` — fetched from jsdelivr CDN in `web/player.html`. For offline / air-gapped use, vendor it into `web/vendor/` and update the `<script src>`. Safari has native HLS and doesn't need it.
+- JDK + Android SDK (build-tools, one platform) — **only** for `./android/build.sh`; nothing at server runtime needs them, and the committed `mediaplayer.apk` means a change to `web/` never requires a rebuild (see the Android section).
 - JetBrains Mono — `@import`ed from Google Fonts at the top of `web/css/tokyo-night.css`. Second CDN hit to remove for air-gapped use; the `--mono` stack already falls back to locally installed Nerd Fonts, so dropping the `@import` degrades gracefully.
+
+## Shared helpers (use these rather than re-inlining)
+
+Small things that exist once on purpose, because the alternative is the same code in three packages drifting apart:
+
+- `transcode.SegPattern` / `SegName(n)` / `ParseSegName(name)` — the `seg_%05d.ts` format. ffmpeg's output pattern, `session.segPath`, the eviction scan and the `/api/stream/hls/` URL parser all go through these, so a rename fails to compile instead of silently producing segments nobody looks for. `ParseSegName` also rejects negatives, which is what keeps a hand-typed `seg_-1.ts` a 400 rather than a range error.
+- `transcode.correctSeek(want, probe)` — the seek back-off walk shared by both modes; only the probe differs (`probeLanding` for remux, `keyframeLanding` for encode). `landingSlop`/`maxSeekTries` are its tunables.
+- `api.writeJSON` / `writeErr` / `writeOK` / `decodePost` — the HTTP envelope. `decodePost` is the POST-required + JSON-decode preamble the three mutating handlers share; it writes its own error response, so callers just `return` on false.
+- `api.Handler.target` / `queryTarget` — mount + path resolution with the safety checks (see Path safety). Every filesystem handler goes through one of them.
+- `tui.listNav(key, sel, n)` — the `j`/`k`/`g`/`G` cursor keys all three tabs share, returning `ok` for "this key was navigation". Tab-specific keys (logs' `ctrl+d`/`ctrl+u` paging) stay in that tab's own switch, which is why paging exists only there.
+- `config.normalizeMounts` — the MaxMounts truncation + `filepath.Clean` that both `Load` and `Replace` must apply, so handlers never Clean a mount path themselves.
+- `api.runThumbnailer` — the only place that knows ffmpegthumbnailer's flags (cached previews and sheet frames both call it).
+- `web/js/api.js`: `json()` wraps fetch + error unwrapping, `post(url, body)` is the JSON-body shape the four mutating endpoints share. It is also the only place that builds API URLs.
 
 ## Architecture
 
@@ -88,15 +113,18 @@ Both probes are best-effort: on error the code proceeds with the uncorrected see
 
 Four independent caches, none of them shared:
 
-- `transcode.probeCache` — ffprobe results keyed `path|size|mtime`, max 512 entries, **flushed wholesale** when full (not LRU). Exists because the player page probes a file and then opens a stream within the same second.
-- `transcode.keyframeCache` — same key scheme, max 128, same flush-all policy. The scan demuxes every packet header (seconds on large files over network mounts) for a tiny result.
+- `transcode.probeCache` — ffprobe results, max 512 entries. Exists because the player page probes a file and then opens a stream within the same second.
+- `transcode.keyframeCache` — max 128. The scan demuxes every packet header (seconds on large files over network mounts) for a tiny result.
+- Both are the same `lru[V]` in `internal/transcode/cache.go`, keyed by `statKey` (`path|size|mtime`, empty and therefore uncacheable when the file can't be stat'ed). They used to be two hand-rolled maps that **flushed wholesale** when full, which meant the request right after a flush re-ran ffprobe on files that had just been warm; eviction is now one entry at a time.
 - Preview thumbnails — a **stable** dir `$TMPDIR/mediaplayer-previews`, sha1(`path|mtime|size`) filenames, so they survive restarts and don't accumulate one dir per launch. Concurrent requests for the same thumbnail serialize on a per-cachePath mutex in a `sync.Map` (`thumbGen`) instead of spawning duplicate `ffmpegthumbnailer` runs. `CleanStaleTempDirs` deliberately does not touch this dir (its prefixes don't match); `make clean` does.
 - Session segment dirs — `os.MkdirTemp("", "mediaplayer-sess-")`, per session, deleted on session shutdown.
 - Thumbnail-sheet frames — **not** a cache: `mediaplayer-sheet-*` per request, `RemoveAll`ed before the response is written (see below).
 
 ### Stars
 
-Server-side, not localStorage: `internal/api/stars.go` persists `[]StarRef{mount, path}` to `~/.config/mediaplayer-stars.json` (path chosen in `main.go::defaultStarsPath`, so `XDG_CONFIG_HOME` applies). `mount` is the mount **index as a string** (whatever the client sent), keyed `mount + ":" + path` — so renumbering mounts orphans stars. Every mutation rewrites the whole file and rolls the in-memory set back if the write fails, keeping memory and disk in sync. Endpoints: `GET /api/stars`, `POST /api/stars/toggle`. The browser page mirrors them into a `Set` at load and renders a `★` in the meta column; `y` toggles.
+Server-side, not localStorage: `internal/api/stars.go` persists `[]StarRef{mount, path}` to `~/.config/mediaplayer-stars.json` (path built by `main.go::configPath`, so `XDG_CONFIG_HOME` applies).
+
+`mount` is the mount **name** (`mountIdentity`: the name, or the path when a mount is unnamed), keyed `mount + ":" + path`. The name is the identity because indices renumber whenever mounts are reordered or deleted, which used to silently re-point every star at a different directory. The browser page still works in indices, so the HTTP layer translates in both directions: `toggleStar` resolves whatever the client sent through `resolveMount` (index _or_ name) and stores the name, while `GET /api/stars` returns `{mount: <current index>, mount_name, path}` — `mount` empty when no configured mount carries that name any more, so an orphan is still listed and still removable. A legacy index-keyed file is migrated on load and rewritten once; an index that resolves to nothing is left verbatim rather than guessed at. Every mutation rewrites the whole file and rolls the in-memory set back if the write fails, keeping memory and disk in sync. Endpoints: `GET /api/stars`, `POST /api/stars/toggle`. The browser page mirrors them into a `Set` at load and renders a `★` in the meta column; `y` toggles.
 
 Note `.gitignore` still lists a root-level `stars.json` from before the move into `~/.config`.
 
@@ -119,7 +147,11 @@ The check is resolve-then-open, so it is not TOCTOU-proof: anything able to crea
 
 ### Frontend state
 
-`web/js/browser.js` is a single IIFE with a flat `state` object. Cursor memory (per `{mountIdx, path}`) and sort preference persist in localStorage. All vim bindings live in one `keydown` handler; mounts 1-9/0 jump by index. Filter, sort, rename, delete share a single reusable modal. `web/js/api.js` is the only place that builds API URLs — add endpoints there, not inline in the pages.
+The browser page is an **ES module graph** (`<script type="module">`), split by concern: `dom.js` (the shared mutable `state`, the resolved `el` handles, and the helpers that touch only those), `listing.js` (mounts, directory, cursor, preview, stars), `sheet.js`, `dialogs.js` (the modal and the filter bar), `disk.js`, and `browser.js` as the entry point holding the keydown handler, the DOM listeners and start-up. The import direction is one-way — dom ← disk ← listing ← {sheet, dialogs} ← browser — and `clearFilter` lives in `dom.js` rather than beside the rest of the filter UI precisely to keep it that way (it only pokes `state`/`el`, and putting it with `openFilter` would make `listing.js` and `dialogs.js` import each other). `api.js` stays a **classic** script: it defines the `window.api`/`fmtSize`/`fmtDate`/`fmtTime` globals both pages share, and the player page has no module tree.
+
+Note module semantics are load-bearing in two small ways: modules are deferred, so `el`'s `getElementById` calls resolve without a DOMContentLoaded wrapper, and they are strict-mode.
+
+Cursor memory (per `{mountIdx, path}`) and sort preference persist in localStorage. All vim bindings live in one `keydown` handler; mounts 1-9/0 jump by index. Filter, sort, rename, delete share a single reusable modal. `web/js/api.js` is the only place that builds API URLs — add endpoints there, not inline in the pages.
 
 `web/js/player.js` has the same shape — one IIFE, flat state — but its keyboard handling is the inverse of the browser page's: a single **capture**-phase listener on `window` (see below), not a bubble-phase one on the document, because the native media controls would otherwise eat or double-act on the keys.
 
@@ -140,7 +172,18 @@ Everything else goes through one `keydown` listener on `window` in the **capture
 
 Fullscreen is requested on `#stage`, **not** the `<video>`: only the fullscreen element's subtree renders, so fullscreening the bare video would hide the OSD and the shortcut card. The OSD and help card therefore live inside `.stage` in the markup. `Esc` while fullscreen is deliberately left to the browser (it would otherwise both exit fullscreen and leave the page).
 
-There's a browser-driven test harness pattern that verified all of the above (real Chromium via puppeteer-core against `/usr/bin/chromium`, real key/mouse events, focus parked on each element in turn). It's worth rebuilding for any further key-handling change — this behavior is not reasonable to verify by reading code.
+#### Browser-driven tests (`make e2e`)
+
+`test/e2e/harness.mjs` is that harness, and it exists because none of the above is verifiable by reading code: real Chromium (puppeteer-core against `/usr/bin/chromium`, override with `CHROME=`), real key and mouse events, focus parked on each element in turn. Run it for any key-handling or frontend-structure change. 34 checks at present, covering the module graph loading cleanly, `j`/`k`/`g`/`G`/`Tab`, the sheet's open/close/`q`/`Escape`/Tab-wrap/`ctrl+q`-bail/key-swallowing, `q` being inert in the list and in a text-input dialog, filter, server-side stars surviving a reload, the disk widget resolving, and on the player page the pointer-focus bounce plus an arrow-key seek.
+
+Four things about it are load-bearing:
+
+- It builds its own fixture (ffmpeg-generated videos, a `.txt`, a `.mp4.part`) in a temp dir and points a scratch config at it.
+- It sets **`XDG_CONFIG_HOME`** into that temp dir, not just `-config`. The stars file's path is derived from the config dir with no flag of its own, so without this the harness toggles stars in your real `~/.config/mediaplayer-stars.json` — and, since starring is a toggle, leaks state from one run into the next (which is exactly how a passing star check turned out to be a leftover from the previous run).
+- Console/network errors fail the run, but only for **our own origin**: hls.js and JetBrains Mono are CDN fetches, and a CDN hiccup or an offline machine must not read as a page defect. Aborted media requests are ignored too — the browser cancels those whenever playback is torn down.
+- The pointer-focus check has to be a real **click**. `:focus-visible` is the signal `player.js` keys off, and programmatic `.focus()` right after a keystroke still counts as keyboard-driven, so a `.focus()` call tests the branch that deliberately _keeps_ focus.
+
+It has already earned its keep: it caught `StarStore.save` writing without `MkdirAll`, so every star toggle 500'd on any machine whose config dir didn't exist yet.
 
 Resume positions live in localStorage under `mp.resume` (`"<mount>:<path>" → {t, dur, ts}`, capped at 200 entries, cleared when the playhead passes 95%). The player page writes them (throttled `timeupdate`, plus close/pagehide) and seeks to the stored position on open — unless the page URL carries `?t=`, which wins (see the thumbnail sheet below). That write-on-pagehide is worth remembering when testing resume behavior: leaving a player page rewrites the entry from the live playhead, so seed `mp.resume` from the browser page, not from the player you're about to navigate away from. The browser page renders them as a dim `▍ NN%` marker in the file list's meta column. While an HLS session is open the player also refetches the playlist every 4 min as a keepalive so a paused video isn't reaped by the 10-min idle timer (every HLS request `Touch()`es the session).
 
@@ -156,7 +199,7 @@ The bar and the label both encode the _used_ fraction (green / `warn` >80% / `cr
 
 `Backspace` in the file list strips a trailing `.part` from a `*.mp4.part` name (case-insensitive) via the normal `/api/rename`, with no confirm modal. It refuses when the stripped name already exists in the listing — `os.Rename` clobbers silently, and the collision case is exactly "the finished file is already there". Note that guard is client-side only: `/api/rename` itself still overwrites, so the rename **dialog** can clobber.
 
-Two things about that key: it used to be `q`, which meant `q` did unrelated things on the two pages, and `Backspace` used to be a third alias for "go up one directory" alongside `h`/`←`. Both were changed together — `Backspace` no longer navigates up, and `q` is unbound on the browser page.
+Two things about that key: it used to be `q`, which meant `q` did unrelated things on the two pages, and `Backspace` used to be a third alias for "go up one directory" alongside `h`/`←`. Both were changed together — `Backspace` no longer navigates up, and `q` is unbound in the file list itself (the thumbnail sheet claims it; see below).
 
 #### Thumbnail sheet (`p`)
 
@@ -177,12 +220,27 @@ The overlay takes its full-viewport geometry from the shared `.modal` rule in `t
 Each frame is a **`<button class="sheet-shot" data-t="…">`**, not a div: clicking one opens `/player?mount=…&path=…&t=<seconds>` for the file the sheet was rendered from (`state.sheetEntry`, captured at open — the cursor is not a reliable stand-in by then). The interaction rules are narrower than the old dismiss-on-anything overlay, and each half is load-bearing:
 
 - One `mousedown`/`touchstart` listener on the overlay (`onSheetPointer`) covers every press: on a frame it plays, on the backdrop it closes, on the card's own chrome it does neither — a click while reading the header shouldn't dismiss. `touchstart` is deliberately **not** `{passive: true}`, since both acting branches `preventDefault` to stop a ghost click landing behind the overlay.
-- The `keydown` guard still sits at the very top of the handler, ahead of the `#modal` guard, but only `Escape` closes now. `Tab` moves between frames and wraps at both ends rather than tabbing off into the invisible file list; `Enter`/`Space` on a focused frame calls `playSheetShot` **directly** rather than falling through to the button's own click, because the overlay listens on `mousedown` and a synthesized click would be a second differently-wired path to the same navigation. Every other key is swallowed with `preventDefault` and does nothing — without that, `G` jumps the cursor behind the overlay.
+- The `keydown` guard still sits at the very top of the handler, ahead of the `#modal` guard, and `Escape` or `q` closes. That is the app-wide rule, and it is the one to extend rather than restate: **`q` dismisses a read-only full-viewport overlay** (this sheet, and the player's help card at `player.js`'s `!helpEl.hidden` branch), while anything containing a text input — the `#modal` form, the filter bar — takes `Escape` **only**, because `q` there is typed text. Scoping is structural, not conventional: the binding sits inside the `if (!el.sheet.hidden)` block, whose every path returns, and `.sheet-card` holds no input. `Tab` moves between frames and wraps at both ends rather than tabbing off into the invisible file list; `Enter`/`Space` on a focused frame calls `playSheetShot` **directly** rather than falling through to the button's own click, because the overlay listens on `mousedown` and a synthesized click would be a second differently-wired path to the same navigation. Every other key is swallowed with `preventDefault` and does nothing — without that, `G` jumps the cursor behind the overlay.
 - Opening parks focus on the first frame (`focus({preventScroll: true})`). Tab order otherwise starts at the page chrome behind the overlay, leaving the frames several tabs from a keyboard that just pressed `p`; `closeSheet` hands focus back via `setActiveCol`.
 
-Immediately below the guard, `Escape` during a still-rendering sheet aborts the fetch — the handler wires `r.Context()` into its ffmpegthumbnailers, so that actually stops the work rather than just hiding it.
+Both pages' handlers bail on `ev.ctrlKey || ev.metaKey || ev.altKey` before anything else, so browser shortcuts (`ctrl+R`, `cmd+L`) survive — load-bearing here specifically, since the sheet block `preventDefault`s every key it doesn't own, and `cmd+Q`/`ctrl+Q` would otherwise hit the new `q` branch.
 
-The `t` the frames pass is a **page** URL param read by `player.js` (`requestedStart`), and it outranks the stored resume position for the first `play()` only; later `play()` calls (quality / audio switches) resume from the live playhead. Do not confuse it with the legacy `t` on `/api/stream/open`, which the server ignores (see spec constraints) — this one never leaves the client. The status line says `from 15:00` for a `?t=` jump and `resumed …` otherwise, which is the quickest way to tell in a browser which path ran.
+Immediately below the guard, `Escape` — and **not** `q` — during a still-rendering sheet aborts the fetch — the handler wires `r.Context()` into its ffmpegthumbnailers, so that actually stops the work rather than just hiding it.
+
+The `t` the frames pass is a **page** URL param read by `player.js` (`requestedStart`), and it outranks the stored resume position for the first `play()` only; later `play()` calls (quality / audio switches) resume from the live playhead. Do not confuse it with the `t` that `/api/stream/open` ignores (see spec constraints) — this one never leaves the client. The status line says `from 15:00` for a `?t=` jump and `resumed …` otherwise, which is the quickest way to tell in a browser which path ran.
+
+### Android app (`android/`) — a second consumer of the same pages
+
+`mediaplayer.apk` is a single-activity WebView wrapper (`android/src/ch/bithawk/mediaplayer/MainActivity.java`, ~400 lines, no third-party deps) pointed at a user-entered server URL stored in `SharedPreferences`. There is no second client: it loads the very same `/` and `/player` the Go binary serves, so **frontend changes ship to the phone with the server**, and nothing in `android/` needs touching for a `web/` edit. `android/build.sh` drives aapt2 / javac / d8 / zipalign / apksigner directly (no Gradle, no network); the self-signed key lives at `~/.config/mediaplayer-android.jks` and losing it means the app can't be updated in place. `android/README.md` is the detail.
+
+What matters when editing `web/`: the wrapper depends on four page behaviors, and breaking any of them breaks only the phone, silently, since desktop Chromium supplies all four itself.
+
+- **Fullscreen is intercepted via `onShowCustomView`**, which fires because `player.js` calls `requestFullscreen()` on `#stage`. The activity hides its action bar, goes immersive and forces landscape, restoring all three on exit — so keep element fullscreen on `#stage` (the OSD/help-card reason for that choice is above; this is a second, independent one).
+- **`MPHost` bridge for keep-awake** — the page never asks Android for a wakelock, so the activity injects a script on every page load that forwards capture-phase `play`/`pause`/`ended` to `MPHost.awake(bool)` → `FLAG_KEEP_SCREEN_ON`. It listens on `document` in the capture phase, so it survives regardless of which element the events come from, but it does assume real media events (a custom playback path that never fires them leaves the screen dimming mid-film).
+- **DOM storage + cookies are enabled explicitly**, because everything stateful the client has rides on them: `mp.cursor` / `mp.sort` / `mp.resume` / `mp.mobilenav.open` in `localStorage`, and the `mp_sid` cookie that ties a browser to its transcode session.
+- **`setMediaPlaybackRequiresUserGesture(false)`** — without it HLS playback stalls waiting for a gesture that already happened on the file list.
+
+Two consequences worth knowing: the mobile layout below 900px (`.mobile-nav`) is the layout the app always renders, so it's not an edge case there; and Nerd Font glyphs render as tofu on Android (no client font to install), which is accepted, not a bug to chase. `usesCleartextTraffic="true"` + `minSdk 26` are deliberate — the server is plain HTTP on a LAN.
 
 ### Routing
 
@@ -201,6 +259,6 @@ The `t` the frames pass is a **page** URL param read by `player.js` (`requestedS
 - Icons are Nerd Font glyphs — need a Nerd Font installed on the client for them to render.
 - Sort default is `ctime_desc` (created newest first), and folders always sort before files regardless of the key.
 - `ctime` needs a `syscall.Stat_t`, so `internal/api/ctime_linux.go` / `ctime_other.go` are build-tagged; the non-Linux fallback returns mtime. Keep both in sync when touching `FileEntry`.
-- `/api/stream/open` still accepts the legacy `t` (start seconds) param and `api.js` still sends it, but the server ignores it — with VOD playlists the client seeks via standard HLS instead of re-spawning at an offset. Don't reintroduce a dependency on it. The `t` on the `/player` **page** URL is a different, live parameter (thumbnail-sheet deep links); the names collide but nothing connects them.
+- `/api/stream/open` ignores a `t` (start seconds) query param, and `api.js` no longer sends one — with VOD playlists the client seeks via standard HLS instead of re-spawning at an offset. The handler's doc comment still notes the param as accepted-and-ignored, so an old cached page can't break; don't reintroduce a dependency on it. The `t` on the `/player` **page** URL is a different, live parameter (thumbnail-sheet deep links); the names collide but nothing connects them.
 - Mount edits are live: `/api/config` POST and the TUI both call `config.Replace`, which mutates the shared `*config.Config` under its own lock and persists. Handlers must read mounts through `Snapshot()`/`MountByIndex()`, never cache them. `Replace` only touches mounts, so `disk` survives it — but `Save()` marshals the whole struct, so any save writes a `"disk"` key into configs that lacked one.
-- Keybind collisions are easy to miss because the two pages have separate handlers. `q` was one (close player on `/player`, strip `.part` on `/`) and was resolved by moving the strip to `Backspace`; `/` is now free of `q` entirely. The binding tables in `README.md` are the cross-page view — check them, not one handler, before claiming a key is free.
+- Keybind collisions are easy to miss because the two pages have separate handlers. `q` was one (close player on `/player`, strip `.part` on `/`) and was resolved by moving the strip to `Backspace`. The binding tables in `README.md` are the cross-page view — check them, not one handler, before claiming a key is free.

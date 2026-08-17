@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -188,95 +187,121 @@ func (s *Session) EnsureSegment(ctx context.Context, n int) (string, error) {
 		}
 		s.mu.Unlock()
 
-		// Need a new batch: stop the current one (if any), evict cache
-		// outside the new window, then spawn ffmpeg starting at n. startMu
-		// makes the whole replacement atomic with respect to other spawners,
-		// so the session never has two live ffmpegs writing the same dir.
-		s.startMu.Lock()
-		// The world may have changed while we waited for startMu — another
-		// request may have installed a batch that covers n, or the session
-		// may have been closed. Re-evaluate before touching anything.
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			s.startMu.Unlock()
-			return "", ErrSessionClosed
-		}
-		b = s.batch
-		if segmentComplete(s.Dir, n, b) || (b != nil && b.Contains(n)) {
-			s.mu.Unlock()
-			s.startMu.Unlock()
-			continue
-		}
-		s.batch = nil
-		s.mu.Unlock()
-		if ctx.Err() != nil {
-			// Client gone — don't spawn a batch nobody will consume.
-			s.startMu.Unlock()
-			return "", ctx.Err()
-		}
-		if b != nil {
-			b.Stop()
-		}
-
-		s.evictOutsideWindow(n)
-
-		count := BatchSize
-		if n+count > s.NumSegments() {
-			count = s.NumSegments() - n
-		}
-		if s.CopyVideo {
-			// The segment muxer writes in place. Leftover files inside the
-			// new range (from a stopped earlier batch) would defeat the
-			// successor-exists completeness check, so clear them; the batch
-			// regenerates them anyway.
-			for i := n; i < n+count; i++ {
-				_ = os.Remove(segPath(s.Dir, i))
-			}
-		}
-		var splits []float64
-		if s.Boundaries != nil {
-			for i := n + 1; i < n+count; i++ {
-				splits = append(splits, s.Boundaries[i])
-			}
-		}
-		nb, err := transcode.StartBatch(transcode.BatchSpec{
-			Input:      s.Input,
-			Dir:        s.Dir,
-			StartSeg:   n,
-			Count:      count,
-			StartSec:   s.segStart(n),
-			DurSec:     s.segStart(n+count) - s.segStart(n),
-			SegDur:     SegDuration,
-			MaxHeight:  s.MaxHeight,
-			AudioIdx:   s.AudioIdx,
-			CopyVideo:  s.CopyVideo,
-			CopyAudio:  s.CopyAudio,
-			SplitTimes: splits,
-		})
-		if err != nil {
-			s.startMu.Unlock()
+		// No batch covers n: replace the session's batch with one that does,
+		// then loop around to the wait branch above.
+		if err := s.startBatchAt(ctx, n); err != nil && !errors.Is(err, errRetry) {
 			return "", err
 		}
-		s.mu.Lock()
-		if s.closed {
-			// Session shut down while we were spawning; don't leak ffmpeg
-			// into a removed dir.
-			s.mu.Unlock()
-			s.startMu.Unlock()
-			nb.Stop()
-			return "", ErrSessionClosed
-		}
-		s.batch = nb
-		s.lastAccess = time.Now()
+	}
+}
+
+// errRetry means "nothing to do, re-evaluate": another request installed a
+// batch covering the segment while this one waited for startMu. It is not a
+// failure and never reaches a client.
+var errRetry = errors.New("retry")
+
+// startBatchAt makes a batch starting at segment n the session's current batch:
+// stop the previous one, evict cache outside the new window, spawn ffmpeg,
+// install it.
+//
+// startMu makes that whole sequence atomic with respect to other spawners, so
+// the session can never have two live ffmpegs writing the same dir — in remux
+// mode (in-place writes) that would corrupt segments and fool the
+// successor-exists completeness check.
+func (s *Session) startBatchAt(ctx context.Context, n int) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+
+	// The world may have changed while we waited for startMu — another request
+	// may have installed a batch that covers n, or the session may have been
+	// closed. Re-evaluate before touching anything.
+	s.mu.Lock()
+	if s.closed {
 		s.mu.Unlock()
-		s.startMu.Unlock()
-		// Loop around to the b.Contains(n) wait branch.
+		return ErrSessionClosed
+	}
+	prev := s.batch
+	if segmentComplete(s.Dir, n, prev) || (prev != nil && prev.Contains(n)) {
+		s.mu.Unlock()
+		return errRetry
+	}
+	s.batch = nil
+	s.mu.Unlock()
+
+	if ctx.Err() != nil {
+		// Client gone — don't spawn a batch nobody will consume. It would stop
+		// the batch a live request is waiting on, and the two would kill each
+		// other's ffmpeg until the deadline.
+		return ctx.Err()
+	}
+	if prev != nil {
+		prev.Stop()
+	}
+	s.evictOutsideWindow(n)
+
+	spec := s.batchSpecFor(n)
+	if s.CopyVideo {
+		// The segment muxer writes in place. Leftover files inside the new
+		// range (from a stopped earlier batch) would defeat the
+		// successor-exists completeness check, so clear them; the batch
+		// regenerates them anyway.
+		for i := n; i < n+spec.Count; i++ {
+			_ = os.Remove(segPath(s.Dir, i))
+		}
+	}
+	nb, err := transcode.StartBatch(spec)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		// Session shut down while we were spawning; don't leak ffmpeg into a
+		// removed dir.
+		s.mu.Unlock()
+		nb.Stop()
+		return ErrSessionClosed
+	}
+	s.batch = nb
+	s.lastAccess = time.Now()
+	s.mu.Unlock()
+	return nil
+}
+
+// batchSpecFor describes the batch that should produce segment n: BatchSize
+// segments forward, clamped to the end of the video, with the interior segment
+// boundaries as explicit split times in remux mode.
+//
+// Reads only fields fixed at session construction, so it needs no lock.
+func (s *Session) batchSpecFor(n int) transcode.BatchSpec {
+	count := BatchSize
+	if n+count > s.NumSegments() {
+		count = s.NumSegments() - n
+	}
+	var splits []float64
+	if s.Boundaries != nil {
+		for i := n + 1; i < n+count; i++ {
+			splits = append(splits, s.Boundaries[i])
+		}
+	}
+	return transcode.BatchSpec{
+		Input:      s.Input,
+		Dir:        s.Dir,
+		StartSeg:   n,
+		Count:      count,
+		StartSec:   s.segStart(n),
+		DurSec:     s.segStart(n+count) - s.segStart(n),
+		SegDur:     SegDuration,
+		MaxHeight:  s.MaxHeight,
+		AudioIdx:   s.AudioIdx,
+		CopyVideo:  s.CopyVideo,
+		CopyAudio:  s.CopyAudio,
+		SplitTimes: splits,
 	}
 }
 
 func segPath(dir string, n int) string {
-	return filepath.Join(dir, fmt.Sprintf("seg_%05d.ts", n))
+	return filepath.Join(dir, transcode.SegName(n))
 }
 
 // segmentComplete reports whether seg_<n>.ts exists and is fully written.
@@ -314,17 +339,12 @@ func (s *Session) evictOutsideWindow(n int) {
 		return
 	}
 	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "seg_") || !strings.HasSuffix(name, ".ts") {
-			continue
-		}
-		idxStr := strings.TrimSuffix(strings.TrimPrefix(name, "seg_"), ".ts")
-		idx, err := strconv.Atoi(idxStr)
-		if err != nil {
+		idx, ok := transcode.ParseSegName(e.Name())
+		if !ok {
 			continue
 		}
 		if idx < lo || idx > hi {
-			_ = os.Remove(filepath.Join(s.Dir, name))
+			_ = os.Remove(filepath.Join(s.Dir, e.Name()))
 		}
 	}
 }

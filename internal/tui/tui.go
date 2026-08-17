@@ -38,6 +38,31 @@ const (
 	cfRestart
 )
 
+// listNav applies the cursor keys every tab shares to a selection index over n
+// items, reporting whether key was one of them. All three tabs had their own
+// copy of this arithmetic; keeping it here means a new tab gets the same
+// navigation for free and a fix lands once. Tab-specific keys (logs' ctrl+d /
+// ctrl+u paging) stay in that tab's own switch.
+func listNav(key string, sel, n int) (int, bool) {
+	switch key {
+	case "j", "down":
+		if sel < n-1 {
+			sel++
+		}
+	case "k", "up":
+		if sel > 0 {
+			sel--
+		}
+	case "g", "home":
+		sel = 0
+	case "G", "end":
+		sel = max(0, n-1)
+	default:
+		return sel, false
+	}
+	return sel, true
+}
+
 type tickMsg time.Time
 
 func tick() tea.Cmd {
@@ -74,7 +99,6 @@ type Model struct {
 	logRows    []logRow
 	collapsed  map[string]bool
 	lSel       int
-	lOffset    int
 
 	// confirm modal
 	confirm    confirmKind

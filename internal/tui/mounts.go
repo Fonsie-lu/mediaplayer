@@ -10,19 +10,11 @@ import (
 )
 
 func (m Model) updateMounts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if sel, ok := listNav(msg.String(), m.mSel, len(m.mounts)); ok {
+		m.mSel = sel
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.mSel < len(m.mounts)-1 {
-			m.mSel++
-		}
-	case "k", "up":
-		if m.mSel > 0 {
-			m.mSel--
-		}
-	case "g", "home":
-		m.mSel = 0
-	case "G", "end":
-		m.mSel = max(0, len(m.mounts)-1)
 	case "a":
 		if len(m.mounts) >= config.MaxMounts {
 			m.status = fmt.Sprintf("mount limit reached (%d)", config.MaxMounts)
