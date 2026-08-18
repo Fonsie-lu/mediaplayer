@@ -129,7 +129,7 @@ func probeUncached(path string) (*ProbeResult, error) {
 	r.PreferredAudio = pickPreferredAudio(r.AudioTracks)
 	// container is comma-separated list; at least one must be direct
 	containerOK := false
-	for _, c := range strings.Split(r.Container, ",") {
+	for c := range strings.SplitSeq(r.Container, ",") {
 		if directContainers[c] {
 			containerOK = true
 			break

@@ -12,12 +12,13 @@ import {
   ICONS,
   saveCursor,
   loadCursor,
+  loadJSON,
   setActiveCol,
   clearFilter,
 } from "./dom.js";
 import { refreshDisk } from "./disk.js";
 
-export function starKey(e) {
+function starKey(e) {
   return `${state.mountIdx}:${e.rel_path}`;
 }
 
@@ -38,7 +39,7 @@ export async function toggleStar() {
     const res = await api.toggleStar(state.mountIdx, e.rel_path);
     if (res.starred) state.stars.add(key);
     else state.stars.delete(key);
-    renderFiles();
+    refreshList(state.focus);
   } catch (err) {
     status("star failed: " + err.message, "err");
   }
@@ -57,15 +58,17 @@ export async function loadMounts() {
   setActiveCol("files");
 }
 
-export function renderMounts() {
-  el.mountList.innerHTML = "";
-  state.mounts.forEach((m, i) => {
-    const li = document.createElement("li");
-    li.dataset.active = i === state.mountIdx ? "true" : "false";
-    li.innerHTML = `<span class="k">${i === 9 ? "0" : i + 1}</span><span class="label">${escape(m.name)}</span>`;
-    li.addEventListener("click", () => selectMount(i));
-    el.mountList.appendChild(li);
-  });
+// Rows carry their index and nothing else: clicks are handled by one
+// delegated listener in browser.js, so a re-render doesn't churn listeners.
+function renderMounts() {
+  el.mountList.innerHTML = state.mounts
+    .map(
+      (m, i) =>
+        `<li data-i="${i}" data-active="${i === state.mountIdx}">` +
+        `<span class="k">${i === 9 ? "0" : i + 1}</span>` +
+        `<span class="label">${escape(m.name)}</span></li>`,
+    )
+    .join("");
 }
 
 export async function selectMount(i) {
@@ -86,12 +89,8 @@ export async function loadDir(presetFocus) {
     state.entries = [];
   }
   applyFilter();
-  state.focus = presetFocus != null ? presetFocus : loadCursor();
-  if (state.focus >= state.filtered.length)
-    state.focus = Math.max(0, state.filtered.length - 1);
-  renderFiles();
+  refreshList(presetFocus != null ? presetFocus : loadCursor());
   renderCrumbs();
-  updatePreview();
   // Not awaited: a different directory may sit on a different filesystem, but
   // the number is a sidebar detail — the listing must not wait on statfs.
   refreshDisk();
@@ -104,7 +103,7 @@ export function applyFilter() {
     : state.entries.filter((e) => e.name.toLowerCase().includes(q));
 }
 
-export function renderCrumbs() {
+function renderCrumbs() {
   const mount = state.mounts[state.mountIdx];
   if (!mount) {
     el.crumbs.textContent = "";
@@ -123,70 +122,80 @@ export function renderCrumbs() {
       frag.push(`<a data-i="${i}" data-path="${escape(acc)}">${escape(p)}</a>`);
   });
   el.crumbs.innerHTML = frag.join("");
-  el.crumbs.querySelectorAll("a").forEach((a) => {
-    a.addEventListener("click", () => {
-      const p = a.dataset.path || "";
-      state.path = p;
-      clearFilter();
-      loadDir();
-    });
-  });
 }
 
-// Watch progress saved by the player page (same localStorage map).
-export function loadResumeMap() {
-  try {
-    return JSON.parse(localStorage.getItem("mp.resume") || "{}");
-  } catch (_) {
-    return {};
-  }
+// openCrumb is the delegated crumb click (wired in browser.js): the root crumb
+// carries no data-path, which is how it navigates to the mount root.
+export function openCrumb(path) {
+  state.path = path || "";
+  clearFilter();
+  loadDir();
 }
 
-export function renderFiles() {
+// Watch progress saved by the player page (same localStorage map). Read per
+// rebuild, which is per directory load / filter / sort / star — not per cursor
+// key, since those only repaint two rows now.
+function loadResumeMap() {
+  return loadJSON("mp.resume");
+}
+
+// renderFiles rebuilds the whole list, so it is for content changes (a new
+// directory, a filter, a sort, a star toggle) — moving the cursor goes through
+// setFocus, which repaints two rows instead of hundreds. Rows are plain markup
+// carrying their index; browser.js has the one delegated click listener.
+function renderFiles() {
   const resume = loadResumeMap();
-  el.fileList.innerHTML = "";
-  state.filtered.forEach((e, i) => {
-    const li = document.createElement("li");
-    li.className = e.is_dir ? "dir" : e.kind;
-    li.dataset.focus = i === state.focus ? "true" : "false";
-    const icon = e.is_dir
-      ? ICONS.folder
-      : e.kind === "video"
-        ? ICONS.video
-        : ICONS.other;
-    let meta = e.is_dir ? "" : `${fmtSize(e.size)} · ${fmtDate(e.ctime)}`;
-    const r = resume[`${state.mountIdx}:${e.rel_path}`];
-    if (r && r.dur) {
-      const pct = Math.min(99, Math.round((r.t / r.dur) * 100));
-      meta = `<span class="resume">▍ ${pct}%</span>` + meta;
-    }
-    if (state.stars.has(starKey(e))) {
-      meta = `<span class="star">★</span>` + meta;
-    }
-    li.innerHTML = `<span class="ic">${icon}</span><span class="name">${escape(e.name)}</span><span class="meta">${meta}</span>`;
-    li.addEventListener("click", () => {
-      state.focus = i;
-      saveCursor();
-      renderFiles();
-      updatePreview();
-      setActiveCol("files");
-      if (e.is_dir) enterFocused();
-    });
-    li.addEventListener("dblclick", () => {
-      state.focus = i;
-      enterFocused();
-    });
-    el.fileList.appendChild(li);
-  });
-  const active = el.fileList.querySelector('li[data-focus="true"]');
-  if (active) active.scrollIntoView({ block: "nearest" });
+  el.fileList.innerHTML = state.filtered
+    .map((e, i) => fileRow(e, i, resume))
+    .join("");
+  scrollFocusIntoView(el.fileList.children[state.focus]);
+}
+
+function fileRow(e, i, resume) {
+  const icon = e.is_dir
+    ? ICONS.folder
+    : e.kind === "video"
+      ? ICONS.video
+      : ICONS.other;
+  let meta = e.is_dir ? "" : `${fmtSize(e.size)} · ${fmtDate(e.ctime)}`;
+  const r = resume[`${state.mountIdx}:${e.rel_path}`];
+  if (r && r.dur) {
+    const pct = Math.min(99, Math.round((r.t / r.dur) * 100));
+    meta = `<span class="resume">▍ ${pct}%</span>` + meta;
+  }
+  if (state.stars.has(starKey(e))) {
+    meta = `<span class="star">★</span>` + meta;
+  }
+  return (
+    `<li class="${e.is_dir ? "dir" : e.kind}" data-i="${i}" data-focus="${i === state.focus}">` +
+    `<span class="ic">${icon}</span>` +
+    `<span class="name">${escape(e.name)}</span>` +
+    `<span class="meta">${meta}</span></li>`
+  );
+}
+
+function scrollFocusIntoView(row) {
+  if (row) row.scrollIntoView({ block: "nearest" });
+}
+
+// renderFocus moves the highlight without touching the rest of the list. The
+// full rebuild used to run on every j/k, which on a large directory meant
+// discarding and recreating every row (and its listeners) per keystroke.
+// Both rows are indexed directly — searching for [data-focus="true"] would be
+// a document-order scan of the whole list for something already known.
+function renderFocus(fromIndex) {
+  const prev = el.fileList.children[fromIndex];
+  if (prev) prev.dataset.focus = "false";
+  const next = el.fileList.children[state.focus];
+  if (next) next.dataset.focus = "true";
+  scrollFocusIntoView(next);
 }
 
 export function currentEntry() {
   return state.filtered[state.focus];
 }
 
-export function updatePreview() {
+function updatePreview() {
   const e = currentEntry();
   const reqId = ++state.previewReq;
   if (!e || e.is_dir || e.kind !== "video") {
@@ -215,26 +224,47 @@ export function updatePreview() {
   ].join("");
 }
 
-export function row(k, v) {
+function row(k, v) {
   return `<div class="row"><span class="k">${escape(k)}</span><span>${escape(String(v))}</span></div>`;
+}
+
+// clamp keeps an index inside a list of n items.
+const clamp = (i, n) => Math.max(0, Math.min(n - 1, i));
+const clampFocus = (i) => clamp(i, state.filtered.length);
+
+// setFocus is the one way the cursor moves: clamp, remember, repaint the
+// highlight and the preview. Every caller used to repeat this trio and it was
+// easy to forget saveCursor. A move that lands where the cursor already is
+// does nothing — updatePreview would otherwise re-request the same thumbnail
+// (a server-side ffmpegthumbnailer spawn) on every repeat of a key held at the
+// end of the list.
+export function setFocus(i) {
+  const next = clampFocus(i);
+  if (next === state.focus) return;
+  const from = state.focus;
+  state.focus = next;
+  saveCursor();
+  renderFocus(from);
+  updatePreview();
+}
+
+// refreshList is setFocus's counterpart for when the listing itself changed
+// (filter applied or cancelled, a star toggled, a fresh directory): rebuild the
+// rows, then land the cursor. It does not persist the cursor — the listing it
+// is landing in may not be the one the position was remembered for.
+export function refreshList(i) {
+  state.focus = clampFocus(i);
+  renderFiles();
+  updatePreview();
 }
 
 export function moveFiles(delta) {
   if (!state.filtered.length) return;
-  state.focus = Math.max(
-    0,
-    Math.min(state.filtered.length - 1, state.focus + delta),
-  );
-  saveCursor();
-  renderFiles();
-  updatePreview();
+  setFocus(state.focus + delta);
 }
 export function moveMounts(delta) {
   if (!state.mounts.length) return;
-  const next = Math.max(
-    0,
-    Math.min(state.mounts.length - 1, state.mountIdx + delta),
-  );
+  const next = clamp(state.mountIdx + delta, state.mounts.length);
   if (next !== state.mountIdx) selectMount(next);
 }
 
@@ -251,7 +281,7 @@ export function enterFocused() {
   }
 }
 
-export function openFocused() {
+function openFocused() {
   openEntry(currentEntry());
 }
 
@@ -274,13 +304,10 @@ export function openEntry(e, startSec) {
 
 // Park the cursor on a named entry after a load that changed the listing —
 // the index isn't known until the load lands, so this runs after loadDir.
-export function focusByName(name) {
+function focusByName(name) {
   const idx = state.filtered.findIndex((e) => e.name === name);
   if (idx < 0) return;
-  state.focus = idx;
-  saveCursor();
-  renderFiles();
-  updatePreview();
+  setFocus(idx);
 }
 
 export function goUp() {

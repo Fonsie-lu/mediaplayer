@@ -238,6 +238,49 @@ try {
     page.url() === urlBefore && !(await modalOpen()) && !(await sheetOpen()),
   );
 
+  // Row clicks are delegated from the two <ul>s rather than bound per row, so
+  // a rebuilt listing must stay clickable — nothing static catches a delegation
+  // handler that reads the wrong dataset key.
+  section("file browser: delegated row clicks");
+  await page.click('#mount-list li[data-i="1"]');
+  const secondActive = await page
+    .waitForSelector('#mount-list li[data-i="1"][data-active="true"]', {
+      timeout: 5000,
+    })
+    .then(() => true)
+    .catch(() => false);
+  check("clicking a mount row switches mounts", secondActive);
+  await page.click('#mount-list li[data-i="0"]');
+  await page.waitForSelector("#file-list li", { timeout: 5000 });
+
+  // data-i=0 is the fixture's only folder — folders sort first, checked above.
+  await page.click('#file-list li[data-i="0"]');
+  const crumb = await page
+    .waitForFunction(() => document.querySelector("#crumbs .cur")?.textContent, {
+      timeout: 5000,
+    })
+    .then((h) => h.jsonValue())
+    .catch(() => null);
+  check("clicking a folder row opens it", crumb === "sub", String(crumb));
+  await page.keyboard.press("h");
+  await page.waitForSelector('#file-list li[data-i="1"]', { timeout: 5000 });
+
+  await page.click('#file-list li[data-i="1"]');
+  const clickedFile = await page
+    .waitForFunction(
+      () =>
+        document.querySelector('#file-list li[data-i="1"]')?.dataset.focus ===
+        "true",
+      { timeout: 5000 },
+    )
+    .then(() => focusedName())
+    .catch(() => null);
+  check(
+    "clicking a file row moves the cursor without leaving the page",
+    clickedFile !== null && page.url() === urlBefore,
+    `${clickedFile} @ ${page.url()}`,
+  );
+
   section("thumbnail sheet");
   // Park the cursor on a video, then render the sheet.
   await page.evaluate(() => {

@@ -9,7 +9,7 @@ window.api = {
     if (!r.ok) throw new Error((data && data.error) || r.statusText);
     return data;
   },
-  // post is every mutating endpoint's shape: JSON body, JSON reply. The four
+  // post is every mutating endpoint's shape: JSON body, JSON reply. The three
   // callers below differ only in URL and payload.
   post(url, body) {
     return this.json(url, {
@@ -81,12 +81,6 @@ window.api = {
   },
   toggleStar(mount, path) {
     return this.post("/api/stars/toggle", { mount: String(mount), path });
-  },
-  getConfig() {
-    return this.json("/api/config");
-  },
-  saveConfig(cfg) {
-    return this.post("/api/config", cfg);
   },
 };
 

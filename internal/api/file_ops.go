@@ -15,7 +15,7 @@ type renameReq struct {
 
 func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
 	var req renameReq
-	if !decodePost(w, r, &req) {
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if strings.ContainsAny(req.NewName, "/\\") || req.NewName == "" || req.NewName == "." || req.NewName == ".." {
@@ -46,7 +46,7 @@ type deleteReq struct {
 
 func (h *Handler) del(w http.ResponseWriter, r *http.Request) {
 	var req deleteReq
-	if !decodePost(w, r, &req) {
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	mount, full, ok := h.target(w, req.Mount, req.Path)

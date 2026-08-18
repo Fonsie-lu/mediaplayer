@@ -1,9 +1,11 @@
 package transcode
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os/exec"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -31,21 +33,35 @@ func KeyframeTimes(path string) ([]float64, error) {
 		"-of", "csv=p=0",
 		path,
 	)
-	out, err := cmd.Output()
+	// Streamed rather than buffered: this is one CSV line per *packet header*,
+	// several MB for a feature-length file, and the scan itself takes seconds
+	// on a network mount. Reading it line by line keeps peak memory at one
+	// line and parses while ffprobe is still demuxing.
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("keyframe scan: %w", err)
 	}
-	times := parseKeyframeCSV(string(out))
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("keyframe scan: %w", err)
+	}
+	times := scanKeyframes(stdout)
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("keyframe scan: %w", err)
+	}
 	keyframeCache.put(key, times)
 	return times, nil
 }
 
-// parseKeyframeCSV extracts keyframe PTS from `pts_time,flags` CSV lines,
-// e.g. "12.345000,K__". Packets without a PTS ("N/A") are skipped.
-func parseKeyframeCSV(out string) []float64 {
+// scanKeyframes extracts keyframe PTS from a stream of `pts_time,flags` CSV
+// lines, e.g. "12.345000,K__". Packets without a PTS ("N/A") are skipped.
+func scanKeyframes(r io.Reader) []float64 {
 	var times []float64
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
+	sc := bufio.NewScanner(r)
+	// A CSV line is short, but a corrupt stream shouldn't kill the scan with
+	// bufio.Scanner's default 64KB token limit.
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
 		ptsStr, flags, ok := strings.Cut(line, ",")
 		if !ok || !strings.Contains(flags, "K") {
 			continue
@@ -56,8 +72,14 @@ func parseKeyframeCSV(out string) []float64 {
 		}
 		times = append(times, pts)
 	}
-	sort.Float64s(times)
+	slices.Sort(times)
 	return times
+}
+
+// parseKeyframeCSV is scanKeyframes over a whole string — the shape the tests
+// use, and the reason the parse stayed separate from the ffprobe plumbing.
+func parseKeyframeCSV(out string) []float64 {
+	return scanKeyframes(strings.NewReader(out))
 }
 
 // BuildBoundaries turns keyframe times into segment boundaries: greedily,
@@ -85,11 +107,9 @@ func BuildBoundaries(keyframes []float64, duration, target float64) []float64 {
 
 // MaxGap returns the longest segment duration in a boundary list.
 func MaxGap(bounds []float64) float64 {
-	max := 0.0
+	worst := 0.0
 	for i := 1; i < len(bounds); i++ {
-		if d := bounds[i] - bounds[i-1]; d > max {
-			max = d
-		}
+		worst = max(worst, bounds[i]-bounds[i-1])
 	}
-	return max
+	return worst
 }

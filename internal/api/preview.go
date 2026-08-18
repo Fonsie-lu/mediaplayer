@@ -33,9 +33,6 @@ func ensurePreviewDir() string {
 	return previewDir
 }
 
-// PreviewDir returns the cache dir, or "" if it hasn't been created yet.
-func PreviewDir() string { return previewDir }
-
 // runThumbnailer is the single place that knows ffmpegthumbnailer's CLI: both
 // the cached previews here and the per-request sheet frames go through it, so
 // the flags and the "errors come back on combined stdout+stderr" behaviour

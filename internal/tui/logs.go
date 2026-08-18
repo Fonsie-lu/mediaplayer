@@ -191,11 +191,11 @@ func (m Model) renderLogRow(r logRow, selected bool) string {
 			file = path.Base(file)
 		}
 		label := fmt.Sprintf("%s %s  %s", marker, r.session, file)
-		count := countStyle.Render(fmt.Sprintf("(%d)", r.count))
+		count := fmt.Sprintf("(%d)", r.count)
 		if selected {
-			return selStyle.Render(fmt.Sprintf("%s %s  %s (%d)", marker, r.session, file, r.count))
+			return selStyle.Render(label + " " + count)
 		}
-		return magStyle.Render(label) + " " + count
+		return magStyle.Render(label) + " " + countStyle.Render(count)
 	}
 
 	ts := r.entry.Time.Format("15:04:05")
@@ -209,18 +209,11 @@ func (m Model) renderLogRow(r logRow, selected bool) string {
 // window renders rows into at most height lines, scrolling so that sel stays
 // visible (roughly centered).
 func window(rows []string, sel, height int) string {
-	if height < 1 {
-		height = 1
-	}
+	height = max(1, height)
 	if len(rows) <= height {
 		return strings.Join(rows, "\n")
 	}
-	off := sel - height/2
-	if off < 0 {
-		off = 0
-	}
-	if off > len(rows)-height {
-		off = len(rows) - height
-	}
+	// Keep sel roughly centred, clamped to the ends of the list.
+	off := min(max(0, sel-height/2), len(rows)-height)
 	return strings.Join(rows[off:off+height], "\n")
 }

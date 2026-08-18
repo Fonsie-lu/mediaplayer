@@ -253,11 +253,7 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // contentHeight is the number of rows available to a tab body.
 func (m Model) contentHeight() int {
-	h := m.height - 5 // tab bar (2) + help (2) + status (1)
-	if h < 3 {
-		h = 3
-	}
-	return h
+	return max(3, m.height-5) // tab bar (2) + help (2) + status (1)
 }
 
 func (m Model) View() tea.View {
@@ -271,7 +267,7 @@ func (m Model) View() tea.View {
 
 	// Tab bar.
 	tabs := make([]string, numTabs)
-	for i := 0; i < int(numTabs); i++ {
+	for i := range int(numTabs) {
 		label := tabNames[i]
 		if tab(i) == m.tab {
 			tabs[i] = tabActive.Render(label)
@@ -308,10 +304,7 @@ func (m Model) View() tea.View {
 	// a flexible gap absorbs the slack when the tab body doesn't fill the area.
 	top := lipgloss.JoinVertical(lipgloss.Left, bar, body)
 	footer := lipgloss.JoinVertical(lipgloss.Left, status, help)
-	gap := m.height - lipgloss.Height(top) - lipgloss.Height(footer) + 1
-	if gap < 1 {
-		gap = 1
-	}
+	gap := max(1, m.height-lipgloss.Height(top)-lipgloss.Height(footer)+1)
 	v.Content = top + strings.Repeat("\n", gap) + footer
 	return v
 }

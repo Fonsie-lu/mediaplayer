@@ -230,7 +230,7 @@ func (h *Handler) getStars(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) toggleStar(w http.ResponseWriter, r *http.Request) {
 	var ref StarRef
-	if !decodePost(w, r, &ref) {
+	if !decodeBody(w, r, &ref) {
 		return
 	}
 	if ref.Path == "" {

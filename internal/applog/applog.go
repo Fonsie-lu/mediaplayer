@@ -36,12 +36,12 @@ type Store struct {
 // Default is the process-wide store used by main when redirecting the logger.
 var Default = New(5000)
 
-// New returns a Store retaining up to max entries.
-func New(max int) *Store {
-	if max <= 0 {
-		max = 1000
+// New returns a Store retaining up to limit entries.
+func New(limit int) *Store {
+	if limit <= 0 {
+		limit = 1000
 	}
-	return &Store{max: max, files: map[string]string{}}
+	return &Store{max: limit, files: map[string]string{}}
 }
 
 var (

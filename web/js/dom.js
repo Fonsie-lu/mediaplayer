@@ -9,6 +9,23 @@
 // Part of the file-browser page. api.js is loaded as a classic script before
 // these modules, so window.api / fmtSize / fmtDate / fmtTime are globals here.
 
+// Web storage throws in private-mode Safari, when the quota is full, and on a
+// corrupt value; nothing the page keeps there is worth failing an interaction
+// over, let alone throwing during module evaluation. Every read and write of
+// mp.* goes through these two.
+export function store(key, value, storage = localStorage) {
+  try {
+    storage.setItem(key, value);
+  } catch (_) {}
+}
+export function loadJSON(key, storage = localStorage) {
+  try {
+    return JSON.parse(storage.getItem(key) || "{}");
+  } catch (_) {
+    return {};
+  }
+}
+
 export const state = {
   mounts: [],
   mountIdx: 0,
@@ -20,7 +37,7 @@ export const state = {
   filter: "",
   stars: new Set(), // keys: `${mountIdx}:${rel_path}`
   // cursorMemory[`${mountIdx}:${path}`] = focus index
-  cursorMemory: JSON.parse(localStorage.getItem("mp.cursor") || "{}"),
+  cursorMemory: loadJSON("mp.cursor"),
   previewReq: 0,
   sheet: null, // frames of the open thumbnail sheet, null when closed
   sheetEntry: null, // the entry those frames came from (click target)
@@ -65,9 +82,7 @@ export function status(msg, kind) {
 
 export function saveCursor() {
   state.cursorMemory[`${state.mountIdx}:${state.path}`] = state.focus;
-  try {
-    localStorage.setItem("mp.cursor", JSON.stringify(state.cursorMemory));
-  } catch (_) {}
+  store("mp.cursor", JSON.stringify(state.cursorMemory));
 }
 export function loadCursor() {
   return state.cursorMemory[`${state.mountIdx}:${state.path}`] || 0;
@@ -97,23 +112,19 @@ export const FALLBACK_ICONS = {
   other: "📄",
   disk: "💾",
 };
-export let ICONS = FALLBACK_ICONS;
-ICONS = navigator.platform.includes("Linux x86_64")
+export const ICONS = navigator.platform.includes("Linux x86_64")
   ? NERD_ICONS
   : FALLBACK_ICONS;
 
+const ESCAPES = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
 export function escape(s) {
-  return String(s).replace(
-    /[&<>"']/g,
-    (c) =>
-      ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;",
-      })[c],
-  );
+  return String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
 // Drop the active filter when navigating to a different directory so the

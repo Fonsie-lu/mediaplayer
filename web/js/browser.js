@@ -7,17 +7,19 @@
 // Part of the file-browser page. api.js is loaded as a classic script before
 // these modules, so window.api / fmtSize / fmtDate / fmtTime are globals here.
 
-import { state, el, ICONS, saveCursor, setActiveCol } from "./dom.js";
+import { state, el, ICONS, setActiveCol, store } from "./dom.js";
 import {
   loadStars,
   loadMounts,
   selectMount,
   applyFilter,
-  renderFiles,
-  updatePreview,
+  setFocus,
+  refreshList,
   moveFiles,
   moveMounts,
   enterFocused,
+  currentEntry,
+  openCrumb,
   goUp,
   toggleStar,
 } from "./listing.js";
@@ -33,7 +35,6 @@ import {
   askRename,
   askDelete,
   askSort,
-  stripPart,
   applySort,
   toggleFilter,
   closeFilter,
@@ -51,7 +52,7 @@ document.addEventListener("keydown", (ev) => {
   // mouse; every other key is swallowed rather than acting on the file list
   // behind the overlay (`G` would otherwise jump the cursor you can't see).
   // `q` mirrors the player page's close key, scoped to this block: the file
-  // list itself leaves `q` unbound (see the `Backspace` case).
+  // list itself leaves `q` unbound.
   if (!el.sheet.hidden) {
     if (ev.key === "Escape" || ev.key === "q") {
       ev.preventDefault();
@@ -112,9 +113,7 @@ document.addEventListener("keydown", (ev) => {
       ev.preventDefault();
       state.filter = el.filterInput.value;
       applyFilter();
-      state.focus = 0;
-      renderFiles();
-      updatePreview();
+      refreshList(0);
       closeFilter(true);
     }
     return;
@@ -185,10 +184,7 @@ document.addEventListener("keydown", (ev) => {
     case "g":
       if (state.gState) {
         state.gState = 0;
-        state.focus = 0;
-        renderFiles();
-        updatePreview();
-        saveCursor();
+        setFocus(0);
       } else {
         state.gState = 1;
         setTimeout(() => (state.gState = 0), 500);
@@ -196,10 +192,7 @@ document.addEventListener("keydown", (ev) => {
       ev.preventDefault();
       break;
     case "G":
-      state.focus = Math.max(0, state.filtered.length - 1);
-      renderFiles();
-      updatePreview();
-      saveCursor();
+      setFocus(state.filtered.length - 1);
       ev.preventDefault();
       break;
     case "r":
@@ -212,12 +205,6 @@ document.addEventListener("keydown", (ev) => {
       break;
     case "y":
       toggleStar();
-      ev.preventDefault();
-      break;
-    // Backspace, not "q": "q" means close on the player page and in the sheet
-    // overlay, and a key that also mutated a file here would be a trap.
-    case "Backspace":
-      stripPart();
       ev.preventDefault();
       break;
     case "p":
@@ -272,13 +259,42 @@ el.sheet.addEventListener("touchstart", onSheetPointer);
 el.mountList.addEventListener("mousedown", () => setActiveCol("mounts"));
 el.fileList.addEventListener("mousedown", () => setActiveCol("files"));
 
+// Row clicks are delegated: the rows are rebuilt whenever the listing changes,
+// and per-row listeners meant re-attaching two of them per row every time.
+const rowIndex = (ev) => {
+  const li = ev.target.closest("li[data-i]");
+  return li ? Number(li.dataset.i) : -1;
+};
+el.fileList.addEventListener("click", (ev) => {
+  const i = rowIndex(ev);
+  if (i < 0) return;
+  setFocus(i);
+  setActiveCol("files");
+  // A folder opens on a single click; a file waits for Enter or a double click,
+  // so the cursor can be parked on it without leaving the page.
+  if (currentEntry()?.is_dir) enterFocused();
+});
+// The click above has already moved the cursor here (a dblclick is always
+// preceded by clicks), so this only has to open what the cursor is on.
+el.fileList.addEventListener("dblclick", (ev) => {
+  if (rowIndex(ev) >= 0) enterFocused();
+});
+el.mountList.addEventListener("click", (ev) => {
+  const i = rowIndex(ev);
+  if (i >= 0) selectMount(i);
+});
+// Crumbs are rebuilt on every load too, so they are delegated like the lists.
+// The root crumb has no data-path, which openCrumb reads as the mount root.
+el.crumbs.addEventListener("click", (ev) => {
+  const a = ev.target.closest("a[data-i]");
+  if (a) openCrumb(a.dataset.path);
+});
+
 // Filter live update; blur also closes the filter (click outside)
 el.filterInput.addEventListener("input", () => {
   state.filter = el.filterInput.value;
   applyFilter();
-  state.focus = 0;
-  renderFiles();
-  updatePreview();
+  refreshList(0);
 });
 el.filterInput.addEventListener("blur", () => {
   // If user clicked elsewhere without pressing ESC/Enter, treat as commit
@@ -294,9 +310,7 @@ const MOBILE_NAV_KEY = "mp.mobilenav.open";
 function setMobileNavOpen(open) {
   el.mobileNav.hidden = !open;
   el.mobileNavToggle.setAttribute("aria-expanded", open ? "true" : "false");
-  try {
-    sessionStorage.setItem(MOBILE_NAV_KEY, open ? "1" : "0");
-  } catch (_) {}
+  store(MOBILE_NAV_KEY, open ? "1" : "0", sessionStorage);
 }
 setMobileNavOpen(sessionStorage.getItem(MOBILE_NAV_KEY) === "1");
 el.mobileNavToggle.addEventListener("click", () => {
@@ -325,9 +339,6 @@ el.mobileNav.addEventListener("click", (ev) => {
     case "rename":
       askRename();
       break;
-    case "unpart":
-      stripPart();
-      break;
     case "sheet":
       openSheet();
       break;
@@ -341,6 +352,12 @@ loadStars().then(loadMounts);
 el.diskIc.textContent = ICONS.disk; // never changes — not per poll
 refreshDisk();
 setInterval(refreshDisk, DISK_POLL_MS);
+// A back-navigation from the player can be served from the bfcache: this page
+// resumes with the DOM it had, so the ▍ NN% markers the player just wrote are
+// not in it. Nothing else rebuilds the rows until the next directory change.
+window.addEventListener("pageshow", (ev) => {
+  if (ev.persisted) refreshList(state.focus);
+});
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refreshDisk();
 });

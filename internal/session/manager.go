@@ -118,8 +118,7 @@ func (s *Session) PlaylistText() string {
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 	for i := 0; i < n; i++ {
-		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", s.segStart(i+1)-s.segStart(i)))
-		b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
+		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%s\n", s.segStart(i+1)-s.segStart(i), transcode.SegName(i))
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	return b.String()

@@ -21,11 +21,11 @@ func (m Model) updateMounts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.beginEdit(-1)
-		return m, textinputFocus(&m.nameInput)
+		return m, m.nameInput.Focus()
 	case "e", "enter", "i":
 		if len(m.mounts) > 0 {
 			m.beginEdit(m.mSel)
-			return m, textinputFocus(&m.nameInput)
+			return m, m.nameInput.Focus()
 		}
 	case "d", "x":
 		if len(m.mounts) > 0 {
@@ -58,11 +58,8 @@ func (m Model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.editing = false
 		return m, nil
-	case "tab", "down":
-		m.editField = (m.editField + 1) % 2
-		m.focusField()
-		return m, nil
-	case "shift+tab", "up":
+	// Two fields, so forward and backward are the same move.
+	case "tab", "down", "shift+tab", "up":
 		m.editField = (m.editField + 1) % 2
 		m.focusField()
 		return m, nil
@@ -145,14 +142,15 @@ func (m Model) viewMounts() string {
 		return b.String()
 	}
 
+	const format = " %s  %-16s %s" // one format for both renderings
 	rows := make([]string, len(m.mounts))
 	for i, mt := range m.mounts {
-		key := dimStyle.Render(fmt.Sprintf("%d", (i+1)%10))
-		line := fmt.Sprintf(" %s  %-16s %s", key, mt.Name, dimStyle.Render(mt.Path))
+		key := fmt.Sprintf("%d", (i+1)%10)
 		if i == m.mSel {
-			line = selStyle.Render(fmt.Sprintf(" %d  %-16s %s", (i+1)%10, mt.Name, mt.Path))
+			rows[i] = selStyle.Render(fmt.Sprintf(format, key, mt.Name, mt.Path))
+			continue
 		}
-		rows[i] = line
+		rows[i] = fmt.Sprintf(format, dimStyle.Render(key), mt.Name, dimStyle.Render(mt.Path))
 	}
 	b.WriteString(window(rows, m.mSel, m.contentHeight()))
 	return b.String()
@@ -170,9 +168,4 @@ func (m Model) viewEdit() string {
 	b.WriteString(inputLabel.Render("Path") + "\n")
 	b.WriteString(m.pathInput.View() + "\n")
 	return b.String()
-}
-
-// textinputFocus returns the blink command for a freshly focused input.
-func textinputFocus(ti interface{ Focus() tea.Cmd }) tea.Cmd {
-	return ti.Focus()
 }

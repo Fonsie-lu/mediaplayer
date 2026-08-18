@@ -10,27 +10,22 @@ type configPayload struct {
 	Mounts []config.Mount `json:"mounts"`
 }
 
-func (h *Handler) configRW(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		snap := h.Cfg.Snapshot()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"host":   snap.Host,
-			"port":   snap.Port,
-			"disk":   snap.Disk,
-			"mounts": snap.Mounts,
-		})
-	case http.MethodPost:
-		var p configPayload
-		if !decodePost(w, r, &p) {
-			return
-		}
-		if err := h.Cfg.Replace(p.Mounts); err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeOK(w)
-	default:
-		writeErr(w, http.StatusMethodNotAllowed, "GET or POST")
+// getConfig reports the whole config. config.Snapshot carries the on-disk JSON
+// tags, so it is already the wire shape — a hand-built map here would just be a
+// second field list to keep in sync.
+func (h *Handler) getConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.Cfg.Snapshot())
+}
+
+// postConfig replaces the mount list, live and persisted.
+func (h *Handler) postConfig(w http.ResponseWriter, r *http.Request) {
+	var p configPayload
+	if !decodeBody(w, r, &p) {
+		return
 	}
+	if err := h.Cfg.Replace(p.Mounts); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeOK(w)
 }

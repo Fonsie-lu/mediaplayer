@@ -1,10 +1,11 @@
 package api
 
 import (
+	"cmp"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -93,26 +94,28 @@ func sortEntries(e []FileEntry, by string) {
 			e[i].lowerName = strings.ToLower(e[i].Name)
 		}
 	}
-	// folders first always
-	sort.SliceStable(e, func(i, j int) bool {
-		if e[i].IsDir != e[j].IsDir {
-			return e[i].IsDir
+	// Folders first always, whatever the key — then the key itself, as a
+	// three-way compare so each case reads in the direction it sorts.
+	slices.SortStableFunc(e, func(a, b FileEntry) int {
+		if a.IsDir != b.IsDir {
+			if a.IsDir {
+				return -1
+			}
+			return 1
 		}
 		switch by {
 		case "name_asc":
-			return e[i].lowerName < e[j].lowerName
+			return cmp.Compare(a.lowerName, b.lowerName)
 		case "name_desc":
-			return e[i].lowerName > e[j].lowerName
+			return cmp.Compare(b.lowerName, a.lowerName)
 		case "size_asc":
-			return e[i].Size < e[j].Size
+			return cmp.Compare(a.Size, b.Size)
 		case "size_desc":
-			return e[i].Size > e[j].Size
+			return cmp.Compare(b.Size, a.Size)
 		case "ctime_asc":
-			return e[i].Ctime < e[j].Ctime
-		case "ctime_desc":
-			fallthrough
-		default:
-			return e[i].Ctime > e[j].Ctime
+			return cmp.Compare(a.Ctime, b.Ctime)
+		default: // ctime_desc, and anything unrecognized
+			return cmp.Compare(b.Ctime, a.Ctime)
 		}
 	})
 }

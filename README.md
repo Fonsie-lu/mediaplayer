@@ -127,7 +127,6 @@ All keys below work in the browser (the web client). They are vim-flavored; arro
 | `r`                 | Rename selected entry                      |
 | `d`                 | Delete selected entry (confirm with `y`)   |
 | `y`                 | Toggle star on selected entry              |
-| `Backspace`         | Strip a trailing `.part` off `*.mp4.part`  |
 | `p`                 | Thumbnail sheet — one frame per 10 min     |
 | `f` or `/`          | Open / close the filter                    |
 | `o`                 | Open the sort dialog                       |
@@ -151,12 +150,6 @@ ignored while it's open, so nothing acts on the file list hidden behind it.
 | `q`                 | Close (rendered sheet only)               |
 | Click outside       | Close                                     |
 | `Esc`               | Close (or cancel a sheet still rendering) |
-
-`Backspace` renames `something.mp4.part` to `something.mp4` in place. It refuses
-when `something.mp4` already exists, so an interrupted download can't overwrite
-the finished file. It does not go up a directory — `h` / `←` do that — and it is
-deliberately not `q`: that key closes the player page and the thumbnail sheet, so
-it never mutates a file.
 
 **Sort shortcuts** (no dialog — capital letter reverses direction)
 
@@ -190,7 +183,7 @@ it never mutates a file.
 Below 900px the mounts column collapses and a tap bar (`☰` toggles it, and the
 open state is remembered for the session) covers the same actions without a
 keyboard: `▲`/`▼` move, `▶` opens, `⇅` sort, `⌕` filter, `✎` rename,
-`✂` strip `.part`, `▦` thumbnail sheet, `✖` delete.
+`▦` thumbnail sheet, `✖` delete.
 
 ### Player (`/player`)
 

@@ -1,16 +1,14 @@
-// The shared modal and everything built on it (rename, delete, sort), the
-// `.part` strip, and the filter bar's open/close behaviour.
+// The shared modal and everything built on it (rename, delete, sort), and the
+// filter bar's open/close behaviour.
 // Part of the file-browser page. api.js is loaded as a classic script before
 // these modules, so window.api / fmtSize / fmtDate / fmtTime are globals here.
 
-import { state, el, status, escape, setActiveCol } from "./dom.js";
+import { state, el, status, escape, setActiveCol, store } from "./dom.js";
 import {
   loadDir,
   currentEntry,
   applyFilter,
-  renderFiles,
-  updatePreview,
-  focusByName,
+  refreshList,
 } from "./listing.js";
 import { refreshDisk } from "./disk.js";
 
@@ -91,34 +89,6 @@ export function askDelete() {
   });
 }
 
-// Drop the trailing ".part" an interrupted download/recording leaves on a
-// finished "….mp4.part" file. No confirm modal — it's one rename, and the
-// dialog would cost more than the keystroke saves.
-export const PART_TAIL = /\.mp4\.part$/i;
-export async function stripPart() {
-  const e = currentEntry();
-  if (!e || e.is_dir || !PART_TAIL.test(e.name)) {
-    status("not a .mp4.part file", "err");
-    return;
-  }
-  const newName = e.name.slice(0, -".part".length);
-  // os.Rename would silently clobber an existing target, so refuse when the
-  // stripped name is already taken (state.entries is the unfiltered listing).
-  if (state.entries.some((x) => x.name === newName)) {
-    status(`${newName} already exists`, "err");
-    return;
-  }
-  try {
-    await api.rename(state.mountIdx, e.rel_path, newName);
-  } catch (err) {
-    status("rename failed: " + err.message, "err");
-    return;
-  }
-  await loadDir();
-  focusByName(newName);
-  status("→ " + newName, "ok");
-}
-
 export function askSort() {
   const opts = [
     ["ctime_desc", "Created (new → old)"],
@@ -143,13 +113,7 @@ export function askSort() {
     ok: "Apply",
     onOk: async () => {
       const sel = document.querySelector('#_sort li[data-selected="true"]');
-      if (sel) {
-        state.sort = sel.dataset.k;
-        try {
-          localStorage.setItem("mp.sort", state.sort);
-        } catch (_) {}
-        await loadDir();
-      }
+      if (sel) await applySort(sel.dataset.k);
     },
   });
   document.querySelectorAll("#_sort li").forEach((li) => {
@@ -175,12 +139,7 @@ export function closeFilter(commit) {
     // Restore the pre-filter focus so ESC feels like a true cancel.
     state.filter = "";
     applyFilter();
-    state.focus = Math.min(
-      state.focusBeforeFilter || 0,
-      Math.max(0, state.filtered.length - 1),
-    );
-    renderFiles();
-    updatePreview();
+    refreshList(state.focusBeforeFilter || 0);
   }
   el.filterInput.blur();
   setActiveCol("files");
@@ -192,9 +151,7 @@ export function toggleFilter() {
 
 export async function applySort(key) {
   state.sort = key;
-  try {
-    localStorage.setItem("mp.sort", key);
-  } catch (_) {}
+  store("mp.sort", key);
   status("sort: " + key.replace("_", " "), "ok");
   await loadDir();
 }

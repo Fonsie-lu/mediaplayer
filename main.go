@@ -71,27 +71,11 @@ func main() {
 
 	h := &api.Handler{Cfg: cfg, Sessions: mgr, Stars: stars}
 
-	mux := http.NewServeMux()
-	h.Register(mux)
-
 	web, err := fs.Sub(webFS, "web")
 	if err != nil {
 		log.Fatalf("embed: %v", err)
 	}
-	fileServer := http.FileServer(http.FS(web))
-	// Two pages, not a SPA (spec): /player is its own URL so browser back
-	// returns to the file browser. Both are served by rewriting to the
-	// embedded file rather than redirecting, which would show .html in the bar.
-	pages := map[string]string{"/": "/browser.html", "/player": "/player.html"}
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if page, ok := pages[r.URL.Path]; ok {
-			r2 := *r
-			r2.URL.Path = page
-			fileServer.ServeHTTP(w, &r2)
-			return
-		}
-		fileServer.ServeHTTP(w, r)
-	})
+	mux := newMux(h, web)
 
 	addr := cfg.Addr()
 	srv := &http.Server{
@@ -138,6 +122,43 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 	shutdown()
+}
+
+// newMux is the server's whole HTTP surface: the API's patterns plus the two
+// pages and the embedded assets. It exists as a function so a test can assert
+// on the same routing table the server runs (see main_test.go).
+//
+// Everything is registered under an exact pattern — there is deliberately no
+// bare "/" catch-all, and that is load-bearing for the API: ServeMux answers a
+// method mismatch with 405 only when *nothing* matched, so a catch-all would
+// swallow every `GET /api/rename` into the file server's 404 and quietly undo
+// the method enforcement in api.Register's patterns.
+//
+// Two pages, not a SPA (spec): /player is its own URL so browser back returns
+// to the file browser. Both are served by rewriting to the embedded file rather
+// than redirecting, which would show .html in the address bar.
+func newMux(h *api.Handler, web fs.FS) *http.ServeMux {
+	mux := http.NewServeMux()
+	h.Register(mux)
+	fileServer := http.FileServer(http.FS(web))
+	mux.HandleFunc("GET /{$}", servePage(fileServer, "/browser.html"))
+	mux.HandleFunc("GET /player", servePage(fileServer, "/player.html"))
+	mux.Handle("GET /css/", fileServer)
+	mux.Handle("GET /js/", fileServer)
+	return mux
+}
+
+// servePage serves one embedded file under whatever URL it is registered at.
+// The request is copied (URL included — the copy would otherwise alias the
+// caller's) so the rewrite can't be seen upstream.
+func servePage(fileServer http.Handler, name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r2 := *r
+		u := *r.URL
+		u.Path = name
+		r2.URL = &u
+		fileServer.ServeHTTP(w, &r2)
+	}
 }
 
 // reexec replaces the current process image with a fresh copy of the executable,

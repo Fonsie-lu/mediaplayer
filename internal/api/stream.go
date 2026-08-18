@@ -185,19 +185,13 @@ func (h *Handler) streamClose(w http.ResponseWriter, r *http.Request) {
 // streamHLS handles both the playlist and the segments under
 // /api/stream/hls/{sid}/{file}. The playlist is generated from session
 // metadata; segments are transcoded on demand in ~1 min batches.
+//
+// file needs no path sanitising: it is one path segment (the mux's {file}
+// wildcard cannot span a slash) and it is never joined onto anything — either
+// it equals the playlist name, or ParseSegName validates it down to an int and
+// the segment path is rebuilt from that.
 func (h *Handler) streamHLS(w http.ResponseWriter, r *http.Request) {
-	const prefix = "/api/stream/hls/"
-	rest := strings.TrimPrefix(r.URL.Path, prefix)
-	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 {
-		writeErr(w, http.StatusBadRequest, "bad path")
-		return
-	}
-	sid, file := parts[0], parts[1]
-	if strings.Contains(file, "..") || strings.Contains(file, "/") {
-		writeErr(w, http.StatusBadRequest, "bad path")
-		return
-	}
+	sid, file := r.PathValue("sid"), r.PathValue("file")
 	sess, ok := h.Sessions.Get(sid)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "no session")

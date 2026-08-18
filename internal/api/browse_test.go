@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func names(e []FileEntry) []string {
 	out := make([]string, len(e))
@@ -51,5 +54,35 @@ func TestClassify(t *testing.T) {
 	}
 	if classify("a.txt", false) != "other" {
 		t.Error("txt should be other")
+	}
+}
+
+// The comparator has six branches and the two tests above cover two of them;
+// this pins the rest, including that an unknown key falls back to ctime_desc.
+func TestSortEntriesAllKeys(t *testing.T) {
+	// Name, size and ctime order the three files differently on purpose: with
+	// one shared ordering, a branch reading the wrong field would still pass.
+	// The directory is in every case because folders-first outranks the key.
+	base := []FileEntry{
+		{Name: "dir", IsDir: true, Size: 4096, Ctime: 5},
+		{Name: "b.mkv", Size: 30, Ctime: 3},
+		{Name: "C.mkv", Size: 10, Ctime: 1},
+		{Name: "a.mkv", Size: 20, Ctime: 2},
+	}
+	cases := map[string][]string{
+		"name_asc":   {"dir", "a.mkv", "b.mkv", "C.mkv"},
+		"name_desc":  {"dir", "C.mkv", "b.mkv", "a.mkv"},
+		"size_asc":   {"dir", "C.mkv", "a.mkv", "b.mkv"},
+		"size_desc":  {"dir", "b.mkv", "a.mkv", "C.mkv"},
+		"ctime_asc":  {"dir", "C.mkv", "a.mkv", "b.mkv"},
+		"ctime_desc": {"dir", "b.mkv", "a.mkv", "C.mkv"},
+		"":           {"dir", "b.mkv", "a.mkv", "C.mkv"}, // unknown = ctime_desc
+	}
+	for by, want := range cases {
+		e := append([]FileEntry(nil), base...)
+		sortEntries(e, by)
+		if got := names(e); !slices.Equal(got, want) {
+			t.Errorf("sort %q: got %v, want %v", by, got, want)
+		}
 	}
 }
