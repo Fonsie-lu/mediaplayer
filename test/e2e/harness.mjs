@@ -296,23 +296,49 @@ try {
   await page.keyboard.press("g");
   check("cursor parked on the folder", (await focusedName()) === "sub");
   await page.waitForSelector("#preview-meta .dir-list li", { timeout: 5000 });
-  const previewNames = await page.$$eval(
-    "#preview-meta .dir-list li .name",
-    (l) => l.map((n) => n.textContent),
-  );
+  // One evaluate for all three facts, not three $evals: the pane replaces its
+  // innerHTML when a directory fetch lands, and a handle taken between two
+  // reads can be detached by that rebuild. Reading inside a single JS turn
+  // cannot straddle it.
+  //
+  // The width is in here because the first version of this pane rendered the
+  // filename into a zero-width box: `.preview .meta { width: 100% }` is a
+  // descendant selector, so a `meta` span in a child row grew to the full row
+  // and squeezed the name out. Only a real layout catches that.
+  const preview = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll("#preview-meta .dir-list li")];
+    return {
+      names: rows.map((li) => li.querySelector(".name").textContent),
+      kinds: rows.map((li) => li.className),
+      nameWidth: rows[0].querySelector(".name").getBoundingClientRect().width,
+      nameSize: getComputedStyle(rows[0].querySelector(".name")).fontSize,
+      footerSize: getComputedStyle(
+        document.querySelector("#preview-meta .dir-total"),
+      ).fontSize,
+    };
+  });
+  const previewNames = preview.names;
   check(
     "folder preview lists the children",
     previewNames.length === 3,
     previewNames.join(","),
   );
-  const previewKinds = await page.$$eval("#preview-meta .dir-list li", (l) =>
-    l.map((li) => li.className),
-  );
   check(
     "child rows carry their kind",
-    previewKinds[0] === "dir" &&
-      previewKinds.filter((c) => c === "dir").length === 1,
-    previewKinds.join(","),
+    preview.kinds[0] === "dir" &&
+      preview.kinds.filter((c) => c === "dir").length === 1,
+    preview.kinds.join(","),
+  );
+  check(
+    "child names have a visible width",
+    preview.nameWidth > 20,
+    `${preview.nameWidth}px`,
+  );
+  // Child rows are 15px against the pane's 13px meta size; the footer is not.
+  check(
+    "child rows are larger than the tally footer",
+    parseFloat(preview.nameSize) > parseFloat(preview.footerSize),
+    `${preview.nameSize} vs ${preview.footerSize}`,
   );
   await page.keyboard.press("Enter");
   await page.waitForFunction(

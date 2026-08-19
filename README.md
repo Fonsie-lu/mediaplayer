@@ -19,7 +19,7 @@ When launched on a terminal it opens a **TUI control panel** (Mounts / Stars / L
 - **Resume positions** stored client-side; the file list shows a progress marker for partially watched files.
 - **Stars** kept server-side (not in `localStorage`), so the same marks show up on every device.
 - **Thumbnail previews** via `ffmpegthumbnailer`, plus a `p`-key **thumbnail sheet**: one frame per 10 minutes of runtime, shown scaled-to-fit in an overlay and never written to disk.
-- **Folder preview** — with the cursor on a directory, the preview column lists that directory's contents in the listing's active sort order (up to 200 rows) instead of sitting empty.
+- **Folder preview** — with the cursor on a directory, the preview column lists that directory's contents — icon and filename — in the listing's active sort order (up to 200 rows) instead of sitting empty.
 - **Disk-usage readout** in the browser header for the filesystem the current directory sits on, hidden when there's nothing useful to show.
 - **Terminal control panel** (TUI) over the live server: edit mount points, review/unstar starred entries, and watch logs grouped by session and filename in collapsible groups — all with vim navigation, plus a key to restart the binary.
 - **Tokyo Night** theme (web and TUI).

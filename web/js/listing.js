@@ -256,10 +256,10 @@ function previewDir(e, reqId) {
   const key = `${state.mountIdx}:${e.rel_path}:${state.sort}`;
   const cached = dirPreviewCache.get(key);
   if (cached) {
-    el.previewMeta.innerHTML = dirPreviewHTML(e, cached);
+    el.previewMeta.innerHTML = dirPreviewHTML(cached);
     return;
   }
-  el.previewMeta.innerHTML = dirPreviewHTML(e, null);
+  el.previewMeta.innerHTML = dirPreviewHTML(null);
   api
     .browse(state.mountIdx, e.rel_path, state.sort)
     .then((r) => {
@@ -270,28 +270,19 @@ function previewDir(e, reqId) {
       }
       dirPreviewCache.set(key, entries);
       if (reqId === state.previewReq)
-        el.previewMeta.innerHTML = dirPreviewHTML(e, entries);
+        el.previewMeta.innerHTML = dirPreviewHTML(entries);
     })
     .catch((err) => {
       if (reqId === state.previewReq)
-        el.previewMeta.innerHTML =
-          dirPreviewHead(e) +
-          `<div class="dir-note err">${escape(err.message)}</div>`;
+        el.previewMeta.innerHTML = `<div class="dir-note err">${escape(err.message)}</div>`;
     });
 }
 
-function dirPreviewHead(e) {
-  return [
-    row("name", e.name),
-    row("created", fmtDate(e.ctime)),
-    row("modified", fmtDate(e.mtime)),
-  ].join("");
-}
-
-// entries === null means the fetch is still out: the head renders now and the
-// list replaces the placeholder, so crossing a folder doesn't blank the pane.
-function dirPreviewHTML(e, entries) {
-  if (!entries) return dirPreviewHead(e) + `<div class="dir-note">…</div>`;
+// entries === null means the fetch is still out. The folder's own name is not
+// repeated here — the cursor is sitting on it in the file list — so the pane is
+// the child rows with the tally as a footer under them.
+function dirPreviewHTML(entries) {
+  if (!entries) return `<div class="dir-note">…</div>`;
   const dirs = entries.filter((c) => c.is_dir).length;
   const files = entries.length - dirs;
   const counts = [
@@ -300,31 +291,36 @@ function dirPreviewHTML(e, entries) {
   ]
     .filter(Boolean)
     .join(" · ");
-  const head = dirPreviewHead(e) + row("contains", counts || "empty");
-  if (!entries.length) return head;
   const shown = entries.slice(0, dirPreviewMax);
   const rest = entries.length - shown.length;
   return (
-    head +
-    `<ul class="dir-list">${shown.map(dirPreviewRow).join("")}</ul>` +
-    (rest ? `<div class="dir-note">… ${rest} more</div>` : "")
+    (shown.length
+      ? `<ul class="dir-list">${shown.map(dirPreviewRow).join("")}</ul>`
+      : "") +
+    (rest ? `<div class="dir-note">… ${rest} more</div>` : "") +
+    `<div class="row dir-total"><span class="k">contains</span><span>${escape(counts || "empty")}</span></div>`
   );
 }
 
+// Icon and filename, nothing else: the pane is a glance at what is inside the
+// folder, and sizes there duplicated the file list without being readable at
+// this width.
+//
 // Inert markup, like every other rendered list on the page — the preview is a
-// read-only look ahead, so these rows carry no index and take no clicks.
+// read-only look ahead, so these rows carry no index and take no clicks. The
+// name span is deliberately NOT class="meta"-adjacent: `.preview .meta` (the
+// head rows' container) is a descendant selector, so a `meta` class in here
+// inherits its `width: 100%` and squeezes the filename to zero width.
 function dirPreviewRow(c) {
   const icon = c.is_dir
     ? ICONS.folder
     : c.kind === "video"
       ? ICONS.video
       : ICONS.other;
-  const meta = c.is_dir ? "" : fmtSize(c.size);
   return (
     `<li class="${c.is_dir ? "dir" : c.kind}">` +
     `<span class="ic">${icon}</span>` +
-    `<span class="name">${escape(c.name)}</span>` +
-    `<span class="meta">${meta}</span></li>`
+    `<span class="name">${escape(c.name)}</span></li>`
   );
 }
 
