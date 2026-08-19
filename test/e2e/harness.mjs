@@ -82,6 +82,11 @@ makeVideo(join(media, "alpha.mp4"), 12);
 makeVideo(join(media, "beta.mp4"), 8);
 writeFileSync(join(media, "notes.txt"), "not a video\n");
 writeFileSync(join(media, "gamma.mp4.part"), "partial\n");
+// Children of `sub`, for the folder-preview check: a directory and two files,
+// so the pane has both row kinds and an order to compare against.
+spawnSync("mkdir", ["-p", join(media, "sub", "nested")]);
+writeFileSync(join(media, "sub", "one.txt"), "one\n");
+writeFileSync(join(media, "sub", "two.txt"), "two\n");
 
 const cfgPath = join(work, "config.json");
 writeFileSync(
@@ -280,6 +285,59 @@ try {
     clickedFile !== null && page.url() === urlBefore,
     `${clickedFile} @ ${page.url()}`,
   );
+
+  // The preview column lists a focused folder's children in the listing's
+  // active sort order. Asserting against the real listing of that folder rather
+  // than a hardcoded order is the point: it is the same sort either way, so a
+  // preview that fetched without state.sort (or fetched the wrong directory)
+  // shows up as a mismatch whatever the active sort happens to be.
+  section("folder preview");
+  await page.keyboard.press("g");
+  await page.keyboard.press("g");
+  check("cursor parked on the folder", (await focusedName()) === "sub");
+  await page.waitForSelector("#preview-meta .dir-list li", { timeout: 5000 });
+  const previewNames = await page.$$eval(
+    "#preview-meta .dir-list li .name",
+    (l) => l.map((n) => n.textContent),
+  );
+  check(
+    "folder preview lists the children",
+    previewNames.length === 3,
+    previewNames.join(","),
+  );
+  const previewKinds = await page.$$eval("#preview-meta .dir-list li", (l) =>
+    l.map((li) => li.className),
+  );
+  check(
+    "child rows carry their kind",
+    previewKinds[0] === "dir" &&
+      previewKinds.filter((c) => c === "dir").length === 1,
+    previewKinds.join(","),
+  );
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(
+    () => document.querySelector("#crumbs .cur")?.textContent === "sub",
+    { timeout: 5000 },
+  );
+  const insideNames = await page.$$eval("#file-list li .name", (l) =>
+    l.map((n) => n.textContent),
+  );
+  check(
+    "preview order matches the folder's own listing",
+    insideNames.join(",") === previewNames.join(","),
+    `${previewNames.join(",")} vs ${insideNames.join(",")}`,
+  );
+  await page.keyboard.press("h");
+  await page.waitForFunction(() => !document.querySelector("#crumbs .cur"), {
+    timeout: 5000,
+  });
+  // Back on a file, the pane goes back to the thumbnail: no stale child rows.
+  await page.keyboard.press("G");
+  await page.waitForFunction(
+    () => !document.querySelector("#preview-meta .dir-list"),
+    { timeout: 5000 },
+  );
+  check("moving off the folder clears the child list", true);
 
   section("thumbnail sheet");
   // Park the cursor on a video, then render the sheet.

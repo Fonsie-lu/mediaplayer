@@ -81,6 +81,7 @@ export async function selectMount(i) {
 }
 
 export async function loadDir(presetFocus) {
+  dirPreviewCache.clear();
   try {
     const r = await api.browse(state.mountIdx, state.path, state.sort);
     state.entries = r.entries || [];
@@ -195,10 +196,26 @@ export function currentEntry() {
   return state.filtered[state.focus];
 }
 
+// Directory listings shown in the preview pane, keyed `mount:path:sort`. The
+// cursor crosses folders faster than the fetches come back, so without this a
+// held `j` would re-request the same directory on every pass over it. Cleared
+// by loadDir, which is also every mutation (rename, delete, sort) — so the
+// cache can never outlive the listing it was read from.
+const dirPreviewCache = new Map();
+const dirPreviewCacheMax = 64;
+// A folder with thousands of children would put megabytes of markup into a
+// pane the user only glances at; the row count is reported either way.
+const dirPreviewMax = 200;
+
 function updatePreview() {
   const e = currentEntry();
   const reqId = ++state.previewReq;
-  if (!e || e.is_dir || e.kind !== "video") {
+  if (e && e.is_dir) {
+    el.previewImg.removeAttribute("src");
+    previewDir(e, reqId);
+    return;
+  }
+  if (!e || e.kind !== "video") {
     el.previewImg.removeAttribute("src");
     el.previewMeta.innerHTML = e
       ? `<div class="row"><span class="k">name</span><span>${escape(e.name)}</span></div>`
@@ -226,6 +243,89 @@ function updatePreview() {
 
 function row(k, v) {
   return `<div class="row"><span class="k">${escape(k)}</span><span>${escape(String(v))}</span></div>`;
+}
+
+// previewDir fills the preview column for a focused folder: the folder's own
+// meta rows plus its children, in the listing's active sort order (the server
+// sorts, so passing state.sort is the whole of it). A cache hit renders in the
+// same turn as the keystroke; a miss shows the meta rows immediately and fills
+// the list in when the fetch lands. Every write is guarded by the reqId that
+// updatePreview stamped, so a slow directory can't paint over a newer cursor
+// position — the same guard the image preview uses.
+function previewDir(e, reqId) {
+  const key = `${state.mountIdx}:${e.rel_path}:${state.sort}`;
+  const cached = dirPreviewCache.get(key);
+  if (cached) {
+    el.previewMeta.innerHTML = dirPreviewHTML(e, cached);
+    return;
+  }
+  el.previewMeta.innerHTML = dirPreviewHTML(e, null);
+  api
+    .browse(state.mountIdx, e.rel_path, state.sort)
+    .then((r) => {
+      const entries = r.entries || [];
+      if (dirPreviewCache.size >= dirPreviewCacheMax) {
+        // Map iterates in insertion order, so this drops the oldest entry.
+        dirPreviewCache.delete(dirPreviewCache.keys().next().value);
+      }
+      dirPreviewCache.set(key, entries);
+      if (reqId === state.previewReq)
+        el.previewMeta.innerHTML = dirPreviewHTML(e, entries);
+    })
+    .catch((err) => {
+      if (reqId === state.previewReq)
+        el.previewMeta.innerHTML =
+          dirPreviewHead(e) +
+          `<div class="dir-note err">${escape(err.message)}</div>`;
+    });
+}
+
+function dirPreviewHead(e) {
+  return [
+    row("name", e.name),
+    row("created", fmtDate(e.ctime)),
+    row("modified", fmtDate(e.mtime)),
+  ].join("");
+}
+
+// entries === null means the fetch is still out: the head renders now and the
+// list replaces the placeholder, so crossing a folder doesn't blank the pane.
+function dirPreviewHTML(e, entries) {
+  if (!entries) return dirPreviewHead(e) + `<div class="dir-note">…</div>`;
+  const dirs = entries.filter((c) => c.is_dir).length;
+  const files = entries.length - dirs;
+  const counts = [
+    dirs ? `${dirs} folder${dirs === 1 ? "" : "s"}` : "",
+    files ? `${files} file${files === 1 ? "" : "s"}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const head = dirPreviewHead(e) + row("contains", counts || "empty");
+  if (!entries.length) return head;
+  const shown = entries.slice(0, dirPreviewMax);
+  const rest = entries.length - shown.length;
+  return (
+    head +
+    `<ul class="dir-list">${shown.map(dirPreviewRow).join("")}</ul>` +
+    (rest ? `<div class="dir-note">… ${rest} more</div>` : "")
+  );
+}
+
+// Inert markup, like every other rendered list on the page — the preview is a
+// read-only look ahead, so these rows carry no index and take no clicks.
+function dirPreviewRow(c) {
+  const icon = c.is_dir
+    ? ICONS.folder
+    : c.kind === "video"
+      ? ICONS.video
+      : ICONS.other;
+  const meta = c.is_dir ? "" : fmtSize(c.size);
+  return (
+    `<li class="${c.is_dir ? "dir" : c.kind}">` +
+    `<span class="ic">${icon}</span>` +
+    `<span class="name">${escape(c.name)}</span>` +
+    `<span class="meta">${meta}</span></li>`
+  );
 }
 
 // clamp keeps an index inside a list of n items.

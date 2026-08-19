@@ -352,6 +352,51 @@
   color: var(--comment);
 }
 
+/* folder preview: the focused directory's children, same sort as the list */
+.preview .dir-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  width: 100%;
+}
+.preview .dir-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+}
+.preview .dir-list li .ic {
+  color: var(--comment);
+  flex: none;
+}
+.preview .dir-list li .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview .dir-list li .meta {
+  flex: none;
+  color: var(--comment);
+  font-size: 12px;
+}
+.preview .dir-list li.dir .name {
+  color: var(--blue);
+}
+.preview .dir-list li.video .name {
+  color: var(--fg);
+}
+.preview .dir-note {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--comment);
+  font-size: 12px;
+}
+.preview .dir-note.err {
+  color: var(--red);
+}
+
 .mobile-nav-wrap {
   display: flex;
   flex-direction: column;
