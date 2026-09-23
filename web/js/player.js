@@ -299,10 +299,20 @@
   //   * backBufferLength — played-out media otherwise stays in the
   //     SourceBuffer for the whole film; a high-bitrate remux hits the
   //     browser's quota (and a phone's memory) long before the end.
+  //   * maxBufferHole — the media a segment carries can begin a few tens of
+  //     milliseconds after the playlist position it is advertised at, so a
+  //     seek landing right on a boundary can put the playhead just ahead of
+  //     the data. The server leaves each batch's first segment a lead for
+  //     exactly this (transcode.segmentLead) and that covers the seeks that
+  //     would otherwise cost an ffmpeg batch; this covers the remainder —
+  //     segments inside a batch, and remux, which gets no lead. At the 0.1s
+  //     default such a gap reads as a hole to fill by fetching the *previous*
+  //     segment; wider, hls.js skips the few ms instead.
   function hlsConfig(startSec) {
     return {
       startPosition: startSec > 0 ? startSec : -1,
       backBufferLength: 30,
+      maxBufferHole: 0.5,
       fragLoadPolicy: {
         default: {
           maxTimeToFirstByteMs: 40000,

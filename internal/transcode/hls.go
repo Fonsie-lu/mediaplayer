@@ -121,13 +121,58 @@ type BatchSpec struct {
 type batchPlan struct {
 	// seekAt is the -ss value: StartSec, or earlier when the landing overshot.
 	seekAt float64
-	// anchor (remux) is the PTS of the first packet ffmpeg copies. Segment
-	// split times are measured from it, since that is where the muxer starts
-	// counting.
+	// anchor is the source time at which the batch's content actually begins:
+	// the PTS of the first packet copied (remux), or StartSec minus the lead
+	// (encode). Remux measures its segment split times from it, since that is
+	// where the muxer starts counting, and both modes stretch -t by however
+	// much earlier than StartSec it sits.
 	anchor float64
-	// backoff (encode) is how many seconds before StartSec decoding begins, to
-	// be cut back off by the trim filter.
+	// backoff (encode) is how many seconds before StartSec decoding begins. All
+	// but `lead` of it is cut back off by the trim filter.
 	backoff float64
+	// lead (encode) is how much of the backoff is kept, so the first segment
+	// starts before the playlist position it is advertised at. See segmentLead.
+	lead float64
+}
+
+// segmentLead is how far before its advertised playlist position a batch's
+// first segment begins.
+//
+// Without it, a seek that lands within a few tens of milliseconds of a segment
+// boundary does not play. The media a segment carries never starts exactly at
+// the playlist position it is advertised at: the encoder's first frame lands on
+// the source's frame grid rather than on our 4s one, AAC priming shifts the
+// audio, and hls.js re-derives each fragment's start from the PTS it parses —
+// measured, the first sample sits 20-80ms late. A playhead inside that window
+// is in a hole, so hls.js goes and fetches the *previous* segment to fill it,
+// and on this server fetching a segment no batch covers stops the batch that
+// was started for the seek target milliseconds earlier and spawns another one.
+// The player then waits for both, from scratch; on a slow source that is
+// seconds per round trip, and enough round trips exhaust its retry budget and
+// end the stream in a fatal error.
+//
+// Starting the batch a little early makes its first segment — the one a seek
+// actually lands on — cover its whole advertised range with margin, so
+// whichever fragment the player picks for a position already contains it. The
+// cost is `lead` seconds of duplicated decoding per batch (a few percent of one
+// segment, once per 16) and an overlap that MSE resolves by keeping the newer
+// append.
+//
+// Encode mode only. Remux was tried and reverted: its -output_ts_offset undoes
+// the -ss rebase exactly, which holds only while the seek lands where it was
+// aimed, and aiming a lead earlier makes correctSeek walk back past whole GOPs
+// on a sparse-keyframe source. Measured, that put a batch's media seconds away
+// from where the playlist said and left the playhead permanently unbuffered —
+// worse than the ~20-45ms exposure it was meant to close, which is itself the
+// smallest of the two modes because copied packets carry their own timestamps.
+const segmentLead = 0.25
+
+// leadFor is the lead a batch starting at startSec can have: the full
+// segmentLead, less at the head of the video, none at all for the batch that
+// starts at 0 — there is nothing before it to start early from, and it is also
+// the one batch whose position no seek can land in front of.
+func leadFor(startSec float64) float64 {
+	return math.Max(0, math.Min(segmentLead, startSec))
 }
 
 // planBatch decides the seek correction for spec by probing the input.
@@ -143,13 +188,18 @@ type batchPlan struct {
 // content starts at or before StartSec; each mode then reconciles the early
 // start exactly (see batchArgs).
 //
+// Encode additionally aims a segmentLead before StartSec, so its first segment
+// starts ahead of the playlist position it is advertised at; remux deliberately
+// does not (see segmentLead).
+//
 // The two modes differ only in how they probe (a copy replay vs a keyframe
 // scan) and in how they reconcile the early start, so the back-off walk itself
-// is shared — see correctSeek. Both probes are best-effort: on error the plan
-// is the uncorrected seek.
+// is shared — see correctSeek. Both probes are best-effort, but they fail
+// differently: encode keeps its lead anyway, since the trim filter puts t=0
+// wherever it chooses, while remux falls back to the uncorrected seek.
 func planBatch(spec BatchSpec) batchPlan {
-	p := batchPlan{seekAt: spec.StartSec, anchor: spec.StartSec}
 	if spec.CopyVideo {
+		p := batchPlan{seekAt: spec.StartSec, anchor: spec.StartSec}
 		if s, l, ok := correctSeek(spec.StartSec, func(at float64) (float64, error) {
 			return probeLanding(spec.Input, at, spec.Origin)
 		}); ok {
@@ -162,17 +212,24 @@ func planBatch(spec BatchSpec) batchPlan {
 		}
 		return p
 	}
-	if spec.StartSec > 0 {
-		if s, l, ok := correctSeek(spec.StartSec, func(at float64) (float64, error) {
-			return keyframeLanding(spec.Input, at, spec.Origin)
-		}); ok {
-			p.seekAt = s
-			if l > spec.StartSec+landingSlop {
-				log.Printf("encode batch [%d..]: no keyframe at or before segment start %.2fs (decode starts %.2fs) — first segment will be short",
-					spec.StartSeg, spec.StartSec, l)
-			}
-			p.backoff = spec.StartSec - p.seekAt
+	// Encode: seek early by the lead even when the probe fails, since the trim
+	// filter places t=0 where the content begins regardless of the landing.
+	lead := leadFor(spec.StartSec)
+	want := spec.StartSec - lead
+	p := batchPlan{seekAt: want, anchor: want, backoff: lead, lead: lead}
+	if s, l, ok := correctSeek(want, func(at float64) (float64, error) {
+		return keyframeLanding(spec.Input, at, spec.Origin)
+	}); ok {
+		p.seekAt = s
+		if l > spec.StartSec+landingSlop {
+			log.Printf("encode batch [%d..]: no keyframe at or before segment start %.2fs (decode starts %.2fs) — first segment will be short",
+				spec.StartSeg, spec.StartSec, l)
 		}
+		p.backoff = spec.StartSec - p.seekAt
+		// Everything the back-off walk reached beyond the lead is trimmed off,
+		// so the lead can never exceed it.
+		p.lead = math.Min(lead, p.backoff)
+		p.anchor = spec.StartSec - p.lead
 	}
 	return p
 }
@@ -199,16 +256,18 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 	// generate our own VOD playlist from session metadata instead.
 	internalPlaylist := filepath.Join(spec.Dir, ".batch.m3u8")
 	seekAt, anchor, backoff := plan.seekAt, plan.anchor, plan.backoff
+	// What the trim filter cuts: everything the seek reached before the lead.
+	trimAt := backoff - plan.lead
 
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 		"-ss", strconv.FormatFloat(seekAt, 'f', 3, 64),
 		"-i", spec.Input,
-		// Copy mode measures -t from the first copied packet (the landing
-		// keyframe), so extend it by the landing slop or the batch tail
-		// would come up short. Encode mode trims to StartSec first, so
-		// DurSec is already exact there.
+		// Both modes measure -t from where their content begins rather than
+		// from StartSec — the landing keyframe in copy mode, StartSec minus the
+		// lead in encode mode — so stretch it by however much earlier that is
+		// or the batch tail comes up short.
 		"-t", strconv.FormatFloat(spec.DurSec+(spec.StartSec-anchor), 'f', 3, 64),
 		"-map", "0:v:0?",
 		"-map", fmt.Sprintf("0:a:%d?", spec.AudioIdx),
@@ -224,12 +283,22 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 			"-preset", "veryfast",
 			"-crf", "19",
 			"-pix_fmt", "yuv420p",
-			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%.3f)", spec.SegDur),
+			// Every segment must open on an IDR. The grid is offset by the
+			// lead because t=0 is the lead's start, not StartSec, so the first
+			// forced keyframe lands on StartSec and the rest follow SegDur from
+			// there — the batch's segment boundaries are where the playlist
+			// says regardless of the lead, and only its first segment is longer.
+			"-force_key_frames", fmt.Sprintf("expr:gte(t,%.3f+n_forced*%.3f)", plan.lead, spec.SegDur),
 		)
 		// With a backoff, decode starts early and the trim filter cuts the
-		// output back to exactly StartSec; setpts shifts the timeline so the
-		// downstream args (-t, force_key_frames, -output_ts_offset) see the
-		// same 0-at-StartSec timebase as the no-backoff path.
+		// output back to the lead before StartSec; setpts then puts t=0 at the
+		// lead's start, which is what the downstream args (-t,
+		// force_key_frames, -output_ts_offset) are all measured from.
+		//
+		// The timeline is rebased to the lead rather than to StartSec — which
+		// would be the tidier zero — because ffmpeg drops video frames whose
+		// filtered PTS is negative (measured: the audio lead survived, the
+		// video lead did not, and the segment started at StartSec after all).
 		//
 		// Deinterlacing goes first, on the source frames: bwdif is temporal,
 		// so it wants its neighbours before the trim discards any. deint=
@@ -239,10 +308,10 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 		if spec.Deinterlace {
 			vf = append(vf, "bwdif=mode=send_frame:deint=interlaced")
 		}
-		if backoff > 0 {
+		if trimAt > 0 {
 			vf = append(vf,
-				fmt.Sprintf("trim=start=%.3f", backoff),
-				fmt.Sprintf("setpts=PTS-%.3f/TB", backoff),
+				fmt.Sprintf("trim=start=%.3f", trimAt),
+				fmt.Sprintf("setpts=PTS-%.3f/TB", trimAt),
 			)
 		}
 		if spec.MaxHeight > 0 {
@@ -252,19 +321,19 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 			args = append(args, "-vf", strings.Join(vf, ","))
 		}
 	}
-	if spec.CopyAudio && backoff == 0 {
+	if spec.CopyAudio && trimAt == 0 {
 		args = append(args, "-c:a", "copy")
 	} else {
-		// Copied audio can't be trimmed by a filter, so a backoff forces an
-		// audio re-encode even for browser-compatible codecs.
+		// Copied audio can't be trimmed by a filter, so a trim forces an audio
+		// re-encode even for browser-compatible codecs.
 		args = append(args,
 			"-c:a", "aac",
 			"-ac", "2",
 			"-b:a", "192k",
 		)
-		if backoff > 0 {
+		if trimAt > 0 {
 			args = append(args, "-af",
-				fmt.Sprintf("atrim=start=%.3f,asetpts=PTS-%.3f/TB", backoff, backoff))
+				fmt.Sprintf("atrim=start=%.3f,asetpts=PTS-%.3f/TB", trimAt, trimAt))
 		}
 	}
 	// Restore the global timeline: input timestamps were shifted down by the
@@ -279,7 +348,9 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 	// n+1 out of order for every seek.
 	tsOffset := seekAt // remux: undo the -ss rebase exactly
 	if !spec.CopyVideo {
-		tsOffset = spec.StartSec // encode: timeline is 0 at StartSec post-trim
+		// encode: post-trim the timeline is 0 where the content begins, which
+		// is StartSec less whatever lead the plan kept.
+		tsOffset = anchor
 	}
 	tsOffset += timelinePad
 	args = append(args,

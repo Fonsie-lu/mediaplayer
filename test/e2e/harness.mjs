@@ -42,6 +42,11 @@ function section(title) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The sheet checks are the only ones that need ffmpegthumbnailer; they are
+// skipped where it isn't installed rather than failing the run.
+const haveThumbnailer =
+  spawnSync("which", ["ffmpegthumbnailer"]).status === 0;
+
 // ---------- fixture ----------
 
 const work = mkdtempSync(join(tmpdir(), "mp-e2e-"));
@@ -118,6 +123,45 @@ function makeRecording(path, seconds) {
   }
 }
 
+// An mpeg2video recording: the DVB SD case, and the one the server can neither
+// direct-play nor remux, so it exercises the encode path — where a batch's
+// first segment carries transcode.segmentLead. Long enough that a seek can
+// land past the first batch (16 segments, ~64s) and have to spawn a new one.
+function makeMPEG2Recording(path, seconds) {
+  const r = spawnSync("ffmpeg", [
+    "-y",
+    "-v",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    `testsrc2=size=320x180:rate=25:duration=${seconds}`,
+    "-f",
+    "lavfi",
+    "-i",
+    `sine=frequency=440:duration=${seconds}`,
+    "-c:v",
+    "mpeg2video",
+    "-qscale:v",
+    "8",
+    "-pix_fmt",
+    "yuv420p",
+    "-g",
+    "12",
+    "-c:a",
+    "aac",
+    "-shortest",
+    "-output_ts_offset",
+    "5000",
+    "-f",
+    "mpegts",
+    path,
+  ]);
+  if (r.status !== 0) {
+    throw new Error(`ffmpeg failed for ${path}: ${r.stderr}`);
+  }
+}
+
 console.log("building fixture…");
 makeVideo(join(media, "alpha.mp4"), 12);
 makeVideo(join(media, "beta.mp4"), 8);
@@ -130,6 +174,7 @@ writeFileSync(join(media, "sub", "one.txt"), "one\n");
 writeFileSync(join(media, "sub", "two.txt"), "two\n");
 // Inside `nested`, whose own contents no listing check looks at.
 makeRecording(join(media, "sub", "nested", "rec.ts"), 90);
+makeMPEG2Recording(join(media, "sub", "nested", "rec-mpeg2.ts"), 130);
 
 const cfgPath = join(work, "config.json");
 writeFileSync(
@@ -221,6 +266,10 @@ try {
   let tolerated = null;
   page.on("response", (r) => {
     if (tolerated && tolerated.test(r.url())) return;
+    // Cursor movement asks for preview thumbnails all through the run, and
+    // without ffmpegthumbnailer every one of them 500s. That is the missing
+    // tool talking, not the page — the same reason the sheet section skips.
+    if (!haveThumbnailer && /\/api\/preview\?/.test(r.url())) return;
     if (ours(r.url()) && r.status() >= 400) {
       consoleErrors.push(`HTTP ${r.status()} ${r.url()}`);
     }
@@ -294,6 +343,24 @@ try {
   // a rebuilt listing must stay clickable — nothing static catches a delegation
   // handler that reads the wrong dataset key.
   section("file browser: delegated row clicks");
+  // The file list is rebuilt wholesale by every load, so waiting for a row to
+  // merely exist matches a node the rebuild then throws away — the click lands
+  // on a detached element and puppeteer reports it as "not clickable". Waiting
+  // for the row that identifies the listing under test is what makes the click
+  // land on the listing the check is about. It stays a real page.click: that
+  // these rows are reachable by an actual pointer is half of what is being
+  // tested.
+  const clickFileRow = async (i, firstRow) => {
+    await page.waitForFunction(
+      (want) =>
+        document.querySelector('#file-list li[data-i="0"] .name')
+          ?.textContent === want,
+      { timeout: 5000 },
+      firstRow,
+    );
+    await page.click(`#file-list li[data-i="${i}"]`);
+  };
+
   await page.click('#mount-list li[data-i="1"]');
   const secondActive = await page
     .waitForSelector('#mount-list li[data-i="1"][data-active="true"]', {
@@ -303,10 +370,9 @@ try {
     .catch(() => false);
   check("clicking a mount row switches mounts", secondActive);
   await page.click('#mount-list li[data-i="0"]');
-  await page.waitForSelector("#file-list li", { timeout: 5000 });
 
   // data-i=0 is the fixture's only folder — folders sort first, checked above.
-  await page.click('#file-list li[data-i="0"]');
+  await clickFileRow(0, "sub");
   const crumb = await page
     .waitForFunction(() => document.querySelector("#crumbs .cur")?.textContent, {
       timeout: 5000,
@@ -315,9 +381,8 @@ try {
     .catch(() => null);
   check("clicking a folder row opens it", crumb === "sub", String(crumb));
   await page.keyboard.press("h");
-  await page.waitForSelector('#file-list li[data-i="1"]', { timeout: 5000 });
 
-  await page.click('#file-list li[data-i="1"]');
+  await clickFileRow(1, "sub");
   const clickedFile = await page
     .waitForFunction(
       () =>
@@ -413,69 +478,77 @@ try {
   check("moving off the folder clears the child list", true);
 
   section("thumbnail sheet");
-  // Park the cursor on a video, then render the sheet.
-  await page.evaluate(() => {
-    const items = [...document.querySelectorAll("#file-list li")];
-    const i = items.findIndex(
-      (li) => li.querySelector(".name").textContent === "alpha.mp4",
+  // The sheet is the one section that shells out to ffmpegthumbnailer. Missing,
+  // it is skipped rather than failed — the same treatment the HLS checks get
+  // when hls.js can't be fetched, and for the same reason: a tool this machine
+  // doesn't have is not a defect in the page.
+  if (!haveThumbnailer) {
+    console.log("  skip  ffmpegthumbnailer not installed — sheet checks not run");
+  } else {
+    // Park the cursor on a video, then render the sheet.
+    await page.evaluate(() => {
+      const items = [...document.querySelectorAll("#file-list li")];
+      const i = items.findIndex(
+        (li) => li.querySelector(".name").textContent === "alpha.mp4",
+      );
+      items[i].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      items[i].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    check("cursor parked on the video", (await focusedName()) === "alpha.mp4");
+
+    await page.keyboard.press("p");
+    await page.waitForFunction(() => !document.getElementById("sheet").hidden, {
+      timeout: 20000,
+    });
+    check("p opens the sheet", await sheetOpen());
+    const shots = await page.$$eval(".sheet-shot", (l) => l.length);
+    check("sheet rendered at least one frame", shots >= 1, `got ${shots}`);
+    const focusIsShot = await page.evaluate(() =>
+      document.activeElement?.classList.contains("sheet-shot"),
     );
-    items[i].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    items[i].dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  });
-  check("cursor parked on the video", (await focusedName()) === "alpha.mp4");
+    check("focus parked on the first frame", focusIsShot === true);
 
-  await page.keyboard.press("p");
-  await page.waitForFunction(() => !document.getElementById("sheet").hidden, {
-    timeout: 20000,
-  });
-  check("p opens the sheet", await sheetOpen());
-  const shots = await page.$$eval(".sheet-shot", (l) => l.length);
-  check("sheet rendered at least one frame", shots >= 1, `got ${shots}`);
-  const focusIsShot = await page.evaluate(() =>
-    document.activeElement?.classList.contains("sheet-shot"),
-  );
-  check("focus parked on the first frame", focusIsShot === true);
+    // Tab must wrap inside the overlay rather than escaping to the page behind.
+    await page.keyboard.press("Tab");
+    const stillInSheet = await page.evaluate(() =>
+      document.activeElement?.classList.contains("sheet-shot"),
+    );
+    check("Tab stays inside the sheet", stillInSheet === true);
 
-  // Tab must wrap inside the overlay rather than escaping to the page behind.
-  await page.keyboard.press("Tab");
-  const stillInSheet = await page.evaluate(() =>
-    document.activeElement?.classList.contains("sheet-shot"),
-  );
-  check("Tab stays inside the sheet", stillInSheet === true);
+    // The modifier bail: ctrl+q must not close it (it is an OS quit chord).
+    await page.keyboard.down("Control");
+    await page.keyboard.press("q");
+    await page.keyboard.up("Control");
+    await sleep(100);
+    check("ctrl+q does NOT close the sheet", await sheetOpen());
 
-  // The modifier bail: ctrl+q must not close it (it is an OS quit chord).
-  await page.keyboard.down("Control");
-  await page.keyboard.press("q");
-  await page.keyboard.up("Control");
-  await sleep(100);
-  check("ctrl+q does NOT close the sheet", await sheetOpen());
+    // A key the sheet does not own must not reach the list behind it.
+    const focusUnderneath = await focusedName();
+    await page.keyboard.press("G");
+    await sleep(100);
+    check(
+      "G is swallowed while the sheet is open",
+      (await focusedName()) === focusUnderneath,
+    );
 
-  // A key the sheet does not own must not reach the list behind it.
-  const focusUnderneath = await focusedName();
-  await page.keyboard.press("G");
-  await sleep(100);
-  check(
-    "G is swallowed while the sheet is open",
-    (await focusedName()) === focusUnderneath,
-  );
+    // Now the binding this all exists for.
+    await page.keyboard.press("q");
+    await page.waitForFunction(() => document.getElementById("sheet").hidden, {
+      timeout: 3000,
+    });
+    check("q closes the sheet", !(await sheetOpen()));
 
-  // Now the binding this all exists for.
-  await page.keyboard.press("q");
-  await page.waitForFunction(() => document.getElementById("sheet").hidden, {
-    timeout: 3000,
-  });
-  check("q closes the sheet", !(await sheetOpen()));
-
-  // And Escape still does too.
-  await page.keyboard.press("p");
-  await page.waitForFunction(() => !document.getElementById("sheet").hidden, {
-    timeout: 20000,
-  });
-  await page.keyboard.press("Escape");
-  await page.waitForFunction(() => document.getElementById("sheet").hidden, {
-    timeout: 3000,
-  });
-  check("Escape closes the sheet", !(await sheetOpen()));
+    // And Escape still does too.
+    await page.keyboard.press("p");
+    await page.waitForFunction(() => !document.getElementById("sheet").hidden, {
+      timeout: 20000,
+    });
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => document.getElementById("sheet").hidden, {
+      timeout: 3000,
+    });
+    check("Escape closes the sheet", !(await sheetOpen()));
+  }
 
   section("dialogs");
   await page.keyboard.press("r");
@@ -609,11 +682,19 @@ try {
   // rather than failed, like the CDN errors above.
   section("player page: HLS");
   const segRequests = [];
+  let playlistURL = null;
   const onSegRequest = (r) => {
     const m = r.url().match(/\/seg_(\d+)\.ts$/);
     if (m) segRequests.push(Number(m[1]));
+    if (/\/playlist\.m3u8$/.test(r.url())) playlistURL = r.url();
   };
   page.on("request", onSegRequest);
+  // Each batch start is one log line, which is how a check counts the ffmpeg
+  // runs a seek cost.
+  const countBatches = () => {
+    const lines = serverLog.join("").split("\n");
+    return lines.filter((l) => / batch seg /.test(l)).length;
+  };
   await page.goto(
     `${BASE}/player?mount=0&path=${encodeURIComponent("sub/nested/rec.ts")}&t=20`,
     { waitUntil: "domcontentloaded" },
@@ -665,6 +746,79 @@ try {
       await statusText(),
     );
     tolerated = null;
+
+    // A seek onto an exact segment boundary is the case that used to cost two
+    // ffmpeg batches and sometimes never played: the media a segment carries
+    // began a few tens of ms after the playlist position it was advertised at,
+    // so the playhead landed in a hole and hls.js went off to fetch the
+    // *previous* segment — which stops the batch just started for the seek
+    // target and spawns another. The fix gives each batch's first segment a
+    // lead, and what proves it is the buffer: after the seek the buffered
+    // range has to start at or before the position asked for.
+    //
+    // It runs on the mpeg2video fixture because the lead is encode-mode only
+    // (remux keeps its seek exactly on the segment start — see segmentLead),
+    // and the target is past the first batch so that a new one has to spawn.
+    await page.goto(
+      `${BASE}/player?mount=0&path=${encodeURIComponent("sub/nested/rec-mpeg2.ts")}`,
+      { waitUntil: "domcontentloaded" },
+    );
+    const encodeStarted = await playing(1);
+    check(
+      "an mpeg2 recording transcodes and plays",
+      encodeStarted && /^transcode/.test(await statusText()),
+      await statusText(),
+    );
+    // Segment starts out of the server's own playlist, read from inside the
+    // page so the session cookie applies.
+    const bounds = playlistURL
+      ? await page.evaluate(async (url) => {
+          const res = await fetch(url, { credentials: "same-origin" });
+          if (!res.ok) return null;
+          const out = [];
+          let t = 0;
+          for (const line of (await res.text()).split("\n")) {
+            if (line.startsWith("#EXTINF:")) {
+              out.push(t);
+              t += parseFloat(line.slice(8));
+            }
+          }
+          return out;
+        }, playlistURL)
+      : null;
+    const boundary = bounds && bounds[20];
+    if (!boundary) {
+      check(
+        "playlist gave a segment boundary to seek to",
+        false,
+        String(boundary),
+      );
+    } else {
+      const batchesBefore = countBatches();
+      await page.$eval("#video", (v, t) => (v.currentTime = t), boundary);
+      const resumed = await playing(boundary + 0.4);
+      const bufStart = await page.$eval("#video", (v) =>
+        v.buffered.length ? v.buffered.start(0) : -1,
+      );
+      check(
+        "a seek onto a segment boundary resumes playback",
+        resumed,
+        `at ${boundary}s, status "${await statusText()}"`,
+      );
+      check(
+        "the segment covers the boundary it is advertised at",
+        bufStart >= 0 && bufStart <= boundary,
+        `buffered starts ${bufStart.toFixed(3)}, sought ${boundary.toFixed(3)}`,
+      );
+      // The whole point: the player got what it needed from one batch, instead
+      // of sending the server back to re-encode from a segment earlier.
+      const spawned = countBatches() - batchesBefore;
+      check(
+        "and costs a single ffmpeg batch",
+        spawned === 1,
+        `${spawned} batches spawned`,
+      );
+    }
 
     // The server's direct verdict can't know this browser. Serve the direct
     // request something no browser can decode: the player must fall back to

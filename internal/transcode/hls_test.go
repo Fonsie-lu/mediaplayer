@@ -236,7 +236,8 @@ func TestBatchArgsEncodeUsesHLSMuxer(t *testing.T) {
 		t.Errorf("-hls_flags = %q, want temp_file", got)
 	}
 	// Every segment must open with an IDR or it can't be decoded independently.
-	if got := argVal(t, args, "-force_key_frames"); got != "expr:gte(t,n_forced*4.000)" {
+	// With no lead, the grid starts at t=0.
+	if got := argVal(t, args, "-force_key_frames"); got != "expr:gte(t,0.000+n_forced*4.000)" {
 		t.Errorf("-force_key_frames = %q, want an expr on SegDur", got)
 	}
 	if got := argVal(t, args, "-start_number"); got != "5" {
@@ -371,6 +372,127 @@ func TestBatchArgsSegmentPaths(t *testing.T) {
 // on probe failure.
 func planBatch1(spec BatchSpec) batchPlan {
 	return batchPlan{seekAt: spec.StartSec, anchor: spec.StartSec}
+}
+
+// ---------- the segment lead ----------
+
+// The lead is what stops a seek that lands on a segment boundary from costing
+// an ffmpeg batch: whichever fragment the player picks for that position, the
+// media it gets back has to already contain it. So the batch's first segment
+// must begin before the playlist position it is advertised at, and the rest of
+// the batch's grid must not move with it.
+func TestBatchArgsEncodeLeadStartsSegmentEarly(t *testing.T) {
+	spec := BatchSpec{
+		Input: "in.ts", Dir: "/d", StartSeg: 23, Count: 4,
+		StartSec: 92, DurSec: 16, SegDur: 4, CopyAudio: true,
+	}
+	// A 2.683s back-off, of which segmentLead is kept.
+	plan := batchPlan{seekAt: 89.317, anchor: 92 - segmentLead, backoff: 2.683, lead: segmentLead}
+	args := batchArgs(spec, plan)
+
+	// Content begins at StartSec - lead, and that is where the timeline is
+	// zeroed, so the offset has to name the same instant.
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 92-segmentLead+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want StartSec - lead + pad", got)
+	}
+	// The trim keeps the lead instead of cutting back to StartSec.
+	vf := argVal(t, args, "-vf")
+	if !strings.Contains(vf, "trim=start=2.433") {
+		t.Errorf("-vf = %q, want the trim to stop a lead short of the backoff", vf)
+	}
+	// setpts must match the trim, not the backoff: rebasing to StartSec would
+	// give the lead a negative PTS and ffmpeg drops those video frames.
+	if !strings.Contains(vf, "setpts=PTS-2.433/TB") {
+		t.Errorf("-vf = %q, want setpts rebased to the trim point", vf)
+	}
+	if got := argVal(t, args, "-af"); !strings.Contains(got, "atrim=start=2.433") ||
+		!strings.Contains(got, "asetpts=PTS-2.433/TB") {
+		t.Errorf("-af = %q, want the audio mirror of the video trim", got)
+	}
+	// The keyframe grid is offset by the lead, so segment boundaries inside the
+	// batch stay where the playlist puts them and only the first is longer.
+	if got := argVal(t, args, "-force_key_frames"); got != "expr:gte(t,0.250+n_forced*4.000)" {
+		t.Errorf("-force_key_frames = %q, want the grid offset by the lead", got)
+	}
+	// And the batch still has to reach its intended end, which is now the lead
+	// further away.
+	if got := argFloat(t, args, "-t"); !closeTo(got, 16+segmentLead) {
+		t.Errorf("-t = %v, want DurSec + lead", got)
+	}
+}
+
+// Nothing precedes the video, so the batch at its head takes no lead — and it
+// is also the one batch no seek can land in front of.
+func TestLeadClampedAtHeadOfVideo(t *testing.T) {
+	for _, tc := range []struct {
+		startSec, want float64
+	}{
+		{0, 0},
+		{0.1, 0.1},
+		{segmentLead, segmentLead},
+		{92, segmentLead},
+	} {
+		if got := leadFor(tc.startSec); !closeTo(got, tc.want) {
+			t.Errorf("leadFor(%v) = %v, want %v", tc.startSec, got, tc.want)
+		}
+	}
+	// The head batch keeps the untrimmed, audio-copying shape it always had.
+	spec := BatchSpec{Input: "in.ts", Dir: "/d", Count: 4, DurSec: 16, SegDur: 4, CopyAudio: true}
+	args := batchArgs(spec, batchPlan{})
+	if has(args, "-vf") || has(args, "-af") {
+		t.Errorf("filters at StartSec 0 with no lead: %v", args)
+	}
+	if got := argVal(t, args, "-c:a"); got != "copy" {
+		t.Errorf("-c:a = %q, want copy: with nothing to trim the audio can pass through", got)
+	}
+	if got := argFloat(t, args, "-t"); !closeTo(got, 16) {
+		t.Errorf("-t = %v, want DurSec with no lead to reach back over", got)
+	}
+}
+
+// The back-off walk can stop short of a full lead (a keyframe close in front of
+// StartSec). Trimming to a negative point would drop the batch's opening
+// frames, so the lead shrinks to whatever the walk actually reached.
+func TestLeadNeverExceedsTheBackoff(t *testing.T) {
+	spec := BatchSpec{
+		Input: "in.ts", Dir: "/d", StartSeg: 5, Count: 4,
+		StartSec: 20, DurSec: 16, SegDur: 4, CopyAudio: true,
+	}
+	lead := 0.1
+	args := batchArgs(spec, batchPlan{seekAt: 19.9, anchor: 20 - lead, backoff: lead, lead: lead})
+	if has(args, "-vf") {
+		t.Errorf("-vf = %q, want no trim when the whole backoff is the lead", argVal(t, args, "-vf"))
+	}
+	// Nothing is filtered, so the audio copy survives.
+	if got := argVal(t, args, "-c:a"); got != "copy" {
+		t.Errorf("-c:a = %q, want copy when no filter runs", got)
+	}
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 19.9+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want the seek point + pad", got)
+	}
+	if got := argFloat(t, args, "-t"); !closeTo(got, 16+lead) {
+		t.Errorf("-t = %v, want DurSec + the lead that was reached", got)
+	}
+}
+
+// Remux takes no lead: its -output_ts_offset undoes the -ss rebase exactly, so
+// the seek has to stay where it was aimed. See segmentLead.
+func TestRemuxKeepsSeekOnTheSegmentStart(t *testing.T) {
+	spec := BatchSpec{
+		Input: "in.ts", Dir: "/d", StartSeg: 20, Count: 2,
+		StartSec: 80, DurSec: 8, SegDur: 4,
+		CopyVideo: true, CopyAudio: true, SplitTimes: []float64{84},
+	}
+	args := batchArgs(spec, batchPlan{seekAt: 80, anchor: 80})
+	if got := argFloat(t, args, "-ss"); !closeTo(got, 80) {
+		t.Errorf("-ss = %v, want StartSec untouched by the lead", got)
+	}
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 80+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want seekAt + pad", got)
+	}
+	if got := argVal(t, args, "-c:a"); got != "copy" {
+		t.Errorf("-c:a = %q, want copy: remux has no trim to force a re-encode", got)
+	}
 }
 
 // Deinterlacing runs on source frames, ahead of the backoff trim and the
