@@ -1,10 +1,13 @@
 package transcode
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- helpers ----------
@@ -95,6 +98,20 @@ func TestBatchArgsAudioTrackSelection(t *testing.T) {
 	}
 }
 
+// The batch at the head of the video is the one whose B-frame DTS and AAC
+// priming would go negative and get it shifted against every other batch, so
+// its offset must be positive by more than any decode delay.
+func TestBatchArgsTimelinePadAtHead(t *testing.T) {
+	for _, spec := range []BatchSpec{
+		{Input: "in.mkv", Dir: "/d", Count: 4, DurSec: 16, SegDur: 4},
+		{Input: "in.mkv", Dir: "/d", Count: 4, DurSec: 16, SegDur: 4, CopyVideo: true, SplitTimes: []float64{4, 8, 12}},
+	} {
+		if got := argFloat(t, batchArgs(spec, planBatch1(spec)), "-output_ts_offset"); got < 1 {
+			t.Errorf("copy=%t: -output_ts_offset = %v at StartSec 0, want a pad of at least 1s", spec.CopyVideo, got)
+		}
+	}
+}
+
 // ---------- remux mode ----------
 
 func TestBatchArgsRemuxUsesSegmentMuxer(t *testing.T) {
@@ -127,9 +144,10 @@ func TestBatchArgsRemuxUsesSegmentMuxer(t *testing.T) {
 	if got := argVal(t, args, "-segment_times"); got != "4.000,8.000,12.000" {
 		t.Errorf("-segment_times = %q, want split times relative to the anchor", got)
 	}
-	// Remux undoes the -ss rebase exactly, so PTS stay source-true.
-	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 80) {
-		t.Errorf("-output_ts_offset = %v, want seekAt (80)", got)
+	// Remux undoes the -ss rebase exactly, so PTS stay source-true (plus the
+	// shared pad).
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 80+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want seekAt (80) + pad", got)
 	}
 	if got := argFloat(t, args, "-t"); !closeTo(got, 16) {
 		t.Errorf("-t = %v, want DurSec (16) with no landing slop", got)
@@ -154,8 +172,8 @@ func TestBatchArgsRemuxEarlyLanding(t *testing.T) {
 	if got := argVal(t, args, "-segment_times"); got != "5.500,9.500,13.500" {
 		t.Errorf("-segment_times = %q, want times relative to anchor 78.5", got)
 	}
-	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 78) {
-		t.Errorf("-output_ts_offset = %v, want seekAt (78) so PTS stay source-true", got)
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 78+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want seekAt (78) + pad so PTS stay source-true", got)
 	}
 }
 
@@ -228,8 +246,8 @@ func TestBatchArgsEncodeUsesHLSMuxer(t *testing.T) {
 		t.Error("segment-muxer flags leaked into an encode batch")
 	}
 	// Post-trim the timeline is 0 at StartSec, so that is what gets added back.
-	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 20) {
-		t.Errorf("-output_ts_offset = %v, want StartSec (20)", got)
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 20+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want StartSec (20) + pad", got)
 	}
 	if got := argFloat(t, args, "-t"); !closeTo(got, 16) {
 		t.Errorf("-t = %v, want DurSec exactly (encode trims first)", got)
@@ -289,8 +307,8 @@ func TestBatchArgsEncodeBackoffTrim(t *testing.T) {
 	}
 	// Downstream args see the rebased 0-at-StartSec timeline, same as the
 	// no-backoff path.
-	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 20) {
-		t.Errorf("-output_ts_offset = %v, want StartSec (20) even with a backoff", got)
+	if got := argFloat(t, args, "-output_ts_offset"); !closeTo(got, 20+timelinePad) {
+		t.Errorf("-output_ts_offset = %v, want StartSec (20) + pad even with a backoff", got)
 	}
 	if got := argFloat(t, args, "-t"); !closeTo(got, 16) {
 		t.Errorf("-t = %v, want DurSec (16) even with a backoff", got)
@@ -353,4 +371,91 @@ func TestBatchArgsSegmentPaths(t *testing.T) {
 // on probe failure.
 func planBatch1(spec BatchSpec) batchPlan {
 	return batchPlan{seekAt: spec.StartSec, anchor: spec.StartSec}
+}
+
+// Deinterlacing runs on source frames, ahead of the backoff trim and the
+// scale: bwdif is temporal and wants the neighbours the trim would discard.
+func TestBatchArgsEncodeDeinterlaceFirst(t *testing.T) {
+	spec := BatchSpec{
+		Input: "in.ts", Dir: "/d", StartSeg: 5, Count: 4,
+		StartSec: 20, DurSec: 16, SegDur: 4, MaxHeight: 720, Deinterlace: true,
+	}
+	vf := argVal(t, batchArgs(spec, batchPlan{seekAt: 18, anchor: 20, backoff: 2}), "-vf")
+	bwdifAt, trimAt, scaleAt := strings.Index(vf, "bwdif="), strings.Index(vf, "trim="), strings.Index(vf, "scale=")
+	if bwdifAt != 0 || trimAt < bwdifAt || scaleAt < trimAt {
+		t.Errorf("-vf = %q, want bwdif first, then trim, then scale", vf)
+	}
+	// Frames not flagged interlaced (a progressive ad break) pass untouched.
+	if !strings.Contains(vf, "deint=interlaced") {
+		t.Errorf("-vf = %q, want deint=interlaced", vf)
+	}
+}
+
+// Remux copies video, so there is nothing a filter could deinterlace.
+func TestBatchArgsRemuxIgnoresDeinterlace(t *testing.T) {
+	spec := BatchSpec{
+		Input: "in.ts", Dir: "/d", Count: 2, StartSec: 40, DurSec: 8, SegDur: 4,
+		CopyVideo: true, CopyAudio: true, Deinterlace: true, SplitTimes: []float64{44},
+	}
+	if args := batchArgs(spec, batchPlan{seekAt: 40, anchor: 40}); has(args, "-vf") {
+		t.Errorf("-vf in a remux batch: %v", args)
+	}
+}
+
+// discardPartial must hit the file the batch was writing when it died — the
+// newest one it wrote — not simply the highest index: encode batches don't
+// clear their range, so an earlier batch's complete files can sit above it.
+func TestDiscardPartialRemovesLastWritten(t *testing.T) {
+	dir := t.TempDir()
+	write := func(n int, at time.Time) {
+		p := filepath.Join(dir, SegName(n))
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	write(9, start.Add(-time.Minute)) // an earlier batch's, above the partial
+	write(5, start.Add(time.Second))
+	write(6, start.Add(2*time.Second)) // the one being written at the signal
+	tmp := filepath.Join(dir, SegName(7)+".tmp")
+	if err := os.WriteFile(tmp, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Batch{Dir: dir, StartSeg: 5, Count: 6, started: start}
+	b.discardPartial()
+
+	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
+	if exists(filepath.Join(dir, SegName(6))) {
+		t.Error("the last-written segment survived")
+	}
+	for _, n := range []int{5, 9} {
+		if !exists(filepath.Join(dir, SegName(n))) {
+			t.Errorf("%s was removed; only the last-written one should be", SegName(n))
+		}
+	}
+	if exists(tmp) {
+		t.Error("the hls muxer's temp file survived")
+	}
+}
+
+// A batch that died before writing anything must not take an older batch's
+// segment with it.
+func TestDiscardPartialSparesOlderFiles(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, SegName(3))
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	(&Batch{Dir: dir, StartSeg: 0, Count: 8, started: time.Now()}).discardPartial()
+	if _, err := os.Stat(p); err != nil {
+		t.Error("a segment older than the batch was removed")
+	}
 }

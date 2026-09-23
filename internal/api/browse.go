@@ -2,6 +2,7 @@ package api
 
 import (
 	"cmp"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -70,13 +71,16 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		relChild := filepath.Join(rel, e.Name())
+		if e.Type()&fs.ModeSymlink != 0 {
+			info = followLink(mount.Path, relChild, info)
+		}
 		out = append(out, FileEntry{
 			Name:    e.Name(),
-			IsDir:   e.IsDir(),
+			IsDir:   info.IsDir(),
 			Size:    info.Size(),
 			Mtime:   info.ModTime().Unix(),
 			Ctime:   ctimeOf(info),
-			Kind:    classify(e.Name(), e.IsDir()),
+			Kind:    classify(e.Name(), info.IsDir()),
 			RelPath: relChild,
 		})
 	}
@@ -86,6 +90,24 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
 		"path":    rel,
 		"entries": out,
 	})
+}
+
+// followLink describes a symlinked entry by its target, so a linked folder
+// lists (and opens) as a folder and a linked video shows the video's size
+// rather than the link's few bytes. Only links that stay inside the mount are
+// followed — the same rule safeJoin enforces when one is opened, so the
+// listing can't be used to read the size and dates of files elsewhere on the
+// host. Those, and dangling links, keep the link's own info.
+func followLink(root, rel string, link fs.FileInfo) fs.FileInfo {
+	full, err := safeJoin(root, rel)
+	if err != nil {
+		return link
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		return link
+	}
+	return st
 }
 
 func sortEntries(e []FileEntry, by string) {

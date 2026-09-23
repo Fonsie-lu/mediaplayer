@@ -22,6 +22,31 @@
   let currentAudio = 0;
   let keepalive = null;
   let playlistURL = null;
+  // Bumped by every play(). play() awaits the network, so a second call (a
+  // quick quality change, an error fallback) can start while the first is
+  // still waiting; each step checks its generation and a stale one stops
+  // instead of attaching a playlist the server has already replaced.
+  let playGen = 0;
+  // Set once direct playback has failed in this browser. The server's
+  // `direct` verdict is browser-agnostic — Safari has no Matroska, some
+  // builds lack a codec — so the page's own attempt is the final word.
+  let directFailed = false;
+  // Recovery budgets for the current stream, refilled whenever a fragment
+  // lands, so a stream that keeps failing gives up instead of looping.
+  let reopens = 0;
+  let mediaRecoveries = 0;
+  // Where the current play() was asked to start. A failure before playback
+  // gets going leaves currentTime at 0, and a retry from there would throw
+  // the resume position away.
+  let currentStart = 0;
+  function resumePoint() {
+    return video.currentTime > 0 ? video.currentTime : currentStart;
+  }
+  // The in-flight /api/stream/open, aborted when a newer play() supersedes it.
+  let openAbort = null;
+  // Set by closeAndLeave once it has saved the position: the teardown and the
+  // pagehide that follow see a reset playhead and must not write over it.
+  let leaving = false;
 
   // ---------- Resume positions ----------
   // localStorage map `mp.resume`: "<mount>:<path>" -> {t, dur, ts}.
@@ -88,13 +113,22 @@
   // Transient overlay over the video. The native controls auto-hide, so a
   // keyboard seek or volume change would otherwise have no visible effect.
   let osdTimer = null;
-  function osd(text) {
+  function osd(text, ms = 1100) {
     osdEl.textContent = text;
     osdEl.hidden = false;
     clearTimeout(osdTimer);
     osdTimer = setTimeout(() => {
       osdEl.hidden = true;
-    }, 1100);
+    }, ms);
+  }
+
+  // Autoplay is refused without a user gesture in most browsers (the click
+  // that opened this page was on another document). The video then just sits
+  // paused, so say what to do instead of failing silently.
+  function startPlayback() {
+    video.play().catch((e) => {
+      if (e && e.name === "NotAllowedError") osd("▶ press space to play", 5000);
+    });
   }
 
   function canNativeHLS() {
@@ -154,11 +188,16 @@
   }
 
   async function play(startSec) {
+    // Before tearDown: its load() can fire a timeupdate, whose resume write
+    // must already see where this play() is headed.
+    currentStart = startSec;
+    const gen = ++playGen;
     tearDown();
     const resumeNote =
       startSec > 0 ? ` · ${startLabel} ${fmtTime(startSec)}` : "";
     const wantDirect =
       probe.direct &&
+      !directFailed &&
       (currentQuality === "source" || currentQuality === "auto") &&
       !audioOverridden();
     if (wantDirect) {
@@ -167,72 +206,155 @@
       video.addEventListener(
         "loadedmetadata",
         () => {
+          if (gen !== playGen) return;
+          // A container the browser can demux but a video codec it can't
+          // decode plays as audio only in some engines, with no error event.
+          if (probe.width > 0 && video.videoWidth === 0) {
+            fallBackFromDirect("no picture");
+            return;
+          }
           if (startSec > 0) video.currentTime = startSec;
           pickEnglishAudioTrack();
         },
         { once: true },
       );
-      video.play().catch(() => {});
+      startPlayback();
       setStatus(
         `direct · ${probe.vcodec}/${probe.acodec || "-"} · ${probe.width}x${probe.height}` +
           resumeNote,
       );
-    } else {
-      mode = "hls";
-      const q =
-        currentQuality === "auto"
-          ? ""
-          : currentQuality === "source"
-            ? ""
-            : currentQuality;
-      let info;
-      try {
-        info = await api.openStream(mount, path, q, currentAudio);
-      } catch (e) {
-        setStatus("open stream failed: " + e.message, true);
-        return;
-      }
-      await attachHLS(info.playlist);
-      // While paused, no segment requests reach the server and the idle
-      // reaper would kill the session after 10 min. Periodic playlist
-      // fetches keep it alive; teardown stops them so dead tabs still reap.
-      playlistURL = info.playlist;
-      keepalive = setInterval(() => {
-        fetch(playlistURL, { credentials: "same-origin" }).catch(() => {});
-      }, 240000);
-      if (startSec > 0) {
-        // VOD playlist exposes the full timeline immediately, so scrubbing
-        // to startSec just triggers normal segment fetches.
-        const seekWhenReady = () => {
-          try {
-            video.currentTime = startSec;
-          } catch (_) {}
-        };
-        if (video.readyState >= 1) seekWhenReady();
-        else
-          video.addEventListener("loadedmetadata", seekWhenReady, {
-            once: true,
-          });
-      }
-      setStatus(
-        `${info.mode || "transcode"} · ${q || "auto"} · ${fmtTime(info.duration || 0)}` +
-          resumeNote,
-      );
+      return;
     }
+    mode = "hls";
+    const q =
+      currentQuality === "auto" || currentQuality === "source"
+        ? ""
+        : currentQuality;
+    let info;
+    openAbort = new AbortController();
+    try {
+      info = await api.openStream(
+        mount,
+        path,
+        q,
+        currentAudio,
+        openAbort.signal,
+      );
+    } catch (e) {
+      // An abort is this page superseding or leaving the open, not a failure.
+      if (gen === playGen && e.name !== "AbortError")
+        setStatus("open stream failed: " + e.message, true);
+      return;
+    }
+    if (gen !== playGen) return;
+    attachHLS(info.playlist, startSec, gen);
+    // While paused, no segment requests reach the server and the idle
+    // reaper would kill the session after 10 min. Periodic playlist
+    // fetches keep it alive; teardown stops them so dead tabs still reap.
+    playlistURL = info.playlist;
+    keepalive = setInterval(() => {
+      fetch(playlistURL, { credentials: "same-origin" }).catch(() => {});
+    }, 240000);
+    setStatus(
+      `${info.mode || "transcode"} · ${q || "auto"} · ${fmtTime(info.duration || 0)}` +
+        resumeNote +
+        (directFailed ? " · direct play unsupported here" : ""),
+    );
   }
 
-  async function attachHLS(url) {
-    if (window.Hls && window.Hls.isSupported()) {
-      hls = new window.Hls({ lowLatencyMode: false, liveSyncDuration: 4 });
+  // The server can only guess what this browser decodes; when the guess was
+  // wrong, stream the same position through HLS instead (remux when the
+  // video allows it, so usually no transcode).
+  function fallBackFromDirect(why) {
+    if (mode !== "direct" || directFailed) return;
+    directFailed = true;
+    const t = resumePoint();
+    setStatus(`direct playback failed (${why}) — switching to HLS…`);
+    play(t);
+  }
+
+  // Resume where the playhead is, through a fresh server session. For when
+  // the old one is gone: reaped, closed by a pagehide this bfcache'd page
+  // came back from, or lost to a server restart (the TUI's ctrl+r).
+  function reopen() {
+    if (reopens >= 2) return false;
+    reopens++;
+    setStatus("stream session lost — reopening…");
+    play(resumePoint());
+    return true;
+  }
+
+  // hls.js tuning, all for a VOD playlist whose segments are made on demand:
+  //
+  //   * startPosition — load the fragment at the resume point first. Without
+  //     it hls.js fetches segment 0, the server spawns a batch there, and the
+  //     seek that follows loadedmetadata kills that batch for one at the real
+  //     position: a wasted ffmpeg start on every resume, sheet deep link and
+  //     quality or audio switch.
+  //   * fragLoadPolicy — the server holds a segment request open until the
+  //     segment exists: a fresh batch first stops the old one, probes where
+  //     its seek lands, spawns and encodes, and the wait for the segment
+  //     alone may take 30s. hls.js's 10s time-to-first-byte default aborted
+  //     slow ones and re-requested them, and a few in a row went fatal.
+  //   * backBufferLength — played-out media otherwise stays in the
+  //     SourceBuffer for the whole film; a high-bitrate remux hits the
+  //     browser's quota (and a phone's memory) long before the end.
+  function hlsConfig(startSec) {
+    return {
+      startPosition: startSec > 0 ? startSec : -1,
+      backBufferLength: 30,
+      fragLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 40000,
+          maxLoadTimeMs: 120000,
+          timeoutRetry: { maxNumRetry: 2, retryDelayMs: 0, maxRetryDelayMs: 0 },
+          errorRetry: {
+            maxNumRetry: 4,
+            retryDelayMs: 1000,
+            maxRetryDelayMs: 8000,
+          },
+        },
+      },
+    };
+  }
+
+  function attachHLS(url, startSec, gen) {
+    const Hls = window.Hls;
+    if (Hls && Hls.isSupported()) {
+      hls = new Hls(hlsConfig(startSec));
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        reopens = 0;
+        mediaRecoveries = 0;
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (!data.fatal || gen !== playGen) return;
+        // 404 is the session, not the network: the server no longer knows
+        // this sid. hls.js doesn't retry 4xx, so this arrives at once.
+        if (data.response && data.response.code === 404 && reopen()) return;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
+          mediaRecoveries++;
+          hls.recoverMediaError();
+          return;
+        }
+        setStatus("hls fatal: " + data.details, true);
+      });
       hls.loadSource(url);
       hls.attachMedia(video);
-      hls.on(window.Hls.Events.ERROR, (_, data) => {
-        if (data.fatal) setStatus("hls fatal: " + data.details, true);
-      });
-      video.play().catch(() => {});
+      startPlayback();
     } else if (canNativeHLS()) {
+      // Native HLS (Safari) has no start-position hint; seek once the
+      // playlist's timeline is known.
       video.src = url;
-      video.play().catch(() => {});
+      if (startSec > 0) {
+        video.addEventListener(
+          "loadedmetadata",
+          () => {
+            if (gen === playGen) video.currentTime = startSec;
+          },
+          { once: true },
+        );
+      }
+      startPlayback();
     } else if (window.__hlsjsFailed) {
       setStatus(
         "hls.js failed to load and browser lacks native HLS — vendor hls.js offline",
@@ -242,6 +364,35 @@
       setStatus("HLS unsupported in this browser", true);
     }
   }
+
+  // Element-level errors. hls.js reports through its own event, so this is
+  // only for the paths where the browser fetches by itself: a direct file it
+  // turns out not to support, and native HLS losing its session.
+  video.addEventListener("error", () => {
+    const err = video.error;
+    if (!err) return;
+    if (mode === "direct") {
+      if (
+        err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ||
+        err.code === MediaError.MEDIA_ERR_DECODE
+      ) {
+        fallBackFromDirect(
+          err.code === MediaError.MEDIA_ERR_DECODE
+            ? "decode error"
+            : "unsupported",
+        );
+      }
+      return;
+    }
+    if (mode === "hls" && !hls && !reopen()) {
+      setStatus("playback error: " + (err.message || err.code), true);
+    }
+  });
+  // Native HLS has no FRAG_BUFFERED to refill the reopen budget on; playback
+  // actually running is the same signal.
+  video.addEventListener("playing", () => {
+    if (!hls) reopens = 0;
+  });
 
   // Prefer an English audio track if the source has multiple. HLS output is
   // already filtered server-side to a single track, so this only matters for
@@ -270,6 +421,10 @@
   }
 
   function tearDown() {
+    if (openAbort) {
+      openAbort.abort();
+      openAbort = null;
+    }
     if (keepalive) {
       clearInterval(keepalive);
       keepalive = null;
@@ -280,12 +435,17 @@
       } catch (_) {}
       hls = null;
     }
+    mode = "none";
+    // load() with no source also clears video.error and drops any error
+    // event still queued for the old source, so the element-level error
+    // handler can't act on a stream that is already gone.
     video.removeAttribute("src");
     video.load();
   }
 
   async function closeAndLeave() {
-    rememberPosition(video.currentTime, videoDuration());
+    rememberPosition(resumePoint(), videoDuration());
+    leaving = true;
     tearDown();
     try {
       await api.closeStream();
@@ -302,13 +462,13 @@
   // ---------- UI ----------
   qualitySel.addEventListener("change", async () => {
     currentQuality = qualitySel.value;
-    const srcTime = video.currentTime || 0;
+    const srcTime = resumePoint();
     await play(srcTime);
   });
 
   audioSel.addEventListener("change", async () => {
     currentAudio = parseInt(audioSel.value, 10) || 0;
-    const srcTime = video.currentTime || 0;
+    const srcTime = resumePoint();
     await play(srcTime);
   });
 
@@ -317,9 +477,9 @@
   let lastResumeSave = 0;
   video.addEventListener("timeupdate", () => {
     const now = Date.now();
-    if (now - lastResumeSave < 3000) return;
+    if (leaving || now - lastResumeSave < 3000) return;
     lastResumeSave = now;
-    rememberPosition(video.currentTime, videoDuration());
+    rememberPosition(resumePoint(), videoDuration());
   });
   video.addEventListener("ended", () =>
     rememberPosition(videoDuration(), videoDuration()),
@@ -334,8 +494,13 @@
   renderMute();
 
   closeBtn.addEventListener("click", closeAndLeave);
+  // Coming back to a page closeAndLeave left (bfcache): it plays again, so
+  // its position is worth saving again.
+  window.addEventListener("pageshow", (ev) => {
+    if (ev.persisted) leaving = false;
+  });
   window.addEventListener("pagehide", () => {
-    rememberPosition(video.currentTime, videoDuration());
+    if (!leaving) rememberPosition(resumePoint(), videoDuration());
     // best-effort cleanup on back nav or tab close
     try {
       navigator.sendBeacon("/api/stream/close");

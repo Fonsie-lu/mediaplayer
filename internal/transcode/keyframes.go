@@ -2,12 +2,14 @@ package transcode
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // keyframeCache memoizes keyframe scans the same way probeCache does — the
@@ -17,16 +19,43 @@ var keyframeCache = newLRU[[]float64](keyframeCacheMax)
 
 const keyframeCacheMax = 128
 
-// KeyframeTimes returns the sorted PTS (seconds) of every video keyframe.
-// Used by remux mode, where HLS segments can only split on existing
-// keyframes, so the playlist must be built from real keyframe positions
-// instead of a fixed segment-duration grid.
-func KeyframeTimes(path string) ([]float64, error) {
-	key := statKey(path)
-	if cached, ok := keyframeCache.get(key); ok {
-		return cached, nil
+// keyframeScanTimeout bounds one scan. The scan reads the whole file, so on a
+// slow network mount a long film legitimately takes minutes; past this, remux
+// is abandoned for a transcode rather than holding the request open forever.
+const keyframeScanTimeout = 10 * time.Minute
+
+// KeyframeTimes returns the sorted times (seconds) of every video keyframe,
+// measured from origin — the probe's StartTime, which is what ffmpeg's -ss
+// counts from. Used by remux mode, where HLS segments can only split on
+// existing keyframes, so the playlist must be built from real keyframe
+// positions instead of a fixed segment-duration grid.
+//
+// ffprobe reports raw PTS, which for an mpegts recording sit thousands of
+// seconds past zero; left unrebased they all landed past the duration, the
+// boundary list degenerated to one giant segment, and every such file fell
+// back to a full transcode.
+//
+// The returned slice is the caller's own.
+func KeyframeTimes(path string, origin float64) ([]float64, error) {
+	raw, err := keyframeCache.load(statKey(path), func() ([]float64, error) {
+		return scanKeyframeFile(path)
+	})
+	if err != nil {
+		return nil, err
 	}
-	cmd := exec.Command("ffprobe",
+	out := make([]float64, len(raw))
+	for i, t := range raw {
+		out[i] = t - origin
+	}
+	return out, nil
+}
+
+// scanKeyframeFile runs the ffprobe scan behind KeyframeTimes, returning raw
+// (container-clock) PTS.
+func scanKeyframeFile(path string) ([]float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), keyframeScanTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_entries", "packet=pts_time,flags",
@@ -48,7 +77,6 @@ func KeyframeTimes(path string) ([]float64, error) {
 	if err := cmd.Wait(); err != nil {
 		return nil, fmt.Errorf("keyframe scan: %w", err)
 	}
-	keyframeCache.put(key, times)
 	return times, nil
 }
 

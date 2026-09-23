@@ -68,10 +68,12 @@ window.api = {
   // No start offset: the playlist covers the whole video, so the client seeks
   // with standard HLS instead of asking the server to spawn at an offset. (The
   // `t` on the /player *page* URL is unrelated and never reaches the server.)
-  openStream(mount, path, q, audio) {
+  // signal lets the player abandon an open it has superseded; the server then
+  // skips adopting it rather than replacing the newer session.
+  openStream(mount, path, q, audio, signal) {
     const p = new URLSearchParams({ mount: String(mount), path, q: q || "" });
     if (audio != null) p.set("audio", String(audio));
-    return this.json("/api/stream/open?" + p);
+    return this.json("/api/stream/open?" + p, { signal });
   },
   closeStream() {
     return this.json("/api/stream/close", { method: "POST" });

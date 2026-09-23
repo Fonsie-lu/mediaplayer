@@ -1,8 +1,11 @@
 package session
 
 import (
+	"os"
 	"strings"
 	"testing"
+
+	"mediaplayer/internal/transcode"
 )
 
 func TestNumSegments(t *testing.T) {
@@ -157,5 +160,59 @@ func TestBatchSpecForSingleRemuxSegment(t *testing.T) {
 	}
 	if spec.SplitTimes != nil {
 		t.Errorf("SplitTimes = %v, want none for a single segment", spec.SplitTimes)
+	}
+}
+
+func touchSeg(t *testing.T, dir string, n int) {
+	t.Helper()
+	if err := os.WriteFile(segPath(dir, n), []byte("ts"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Encode batches rename finished segments into place, so presence is proof;
+// remux batches write in place, so only a successor (or exit) is.
+func TestSegmentCompleteByMuxer(t *testing.T) {
+	dir := t.TempDir()
+	touchSeg(t, dir, 4)
+	touchSeg(t, dir, 5)
+
+	encode := &transcode.Batch{StartSeg: 4, Count: 4}
+	if !segmentComplete(dir, 4, encode) || !segmentComplete(dir, 5, encode) {
+		t.Error("encode batch: a present segment should be complete")
+	}
+	remux := &transcode.Batch{StartSeg: 4, Count: 4, Sequential: true}
+	if !segmentComplete(dir, 4, remux) {
+		t.Error("remux batch: segment with a successor on disk should be complete")
+	}
+	if segmentComplete(dir, 5, remux) {
+		t.Error("remux batch: the newest file may still be growing")
+	}
+	if segmentComplete(dir, 6, encode) {
+		t.Error("a missing segment is never complete")
+	}
+	if !segmentComplete(dir, 5, nil) {
+		t.Error("with no batch writing, a present file is complete")
+	}
+}
+
+// A batch being stopped vouches for nothing in its range until it has exited:
+// SIGTERM makes the hls muxer finalize its half-written segment under the real
+// name. That holds when it is only the retiring batch, too — the window where
+// the session has no current batch at all is exactly when it matters.
+func TestSegmentCompleteDistrustsStoppingBatch(t *testing.T) {
+	dir := t.TempDir()
+	touchSeg(t, dir, 4)
+	stopping := &transcode.Batch{StartSeg: 0, Count: 16}
+	stopping.Stop() // no process: only marks it stopping
+
+	if segmentComplete(dir, 4, stopping) {
+		t.Error("a stopping batch's segment was trusted")
+	}
+	if segmentComplete(dir, 4, nil, stopping) {
+		t.Error("a retiring batch's segment was trusted while no batch is current")
+	}
+	if !segmentComplete(dir, 4, nil, &transcode.Batch{StartSeg: 20, Count: 16}) {
+		t.Error("a batch that doesn't cover the segment must not veto it")
 	}
 }

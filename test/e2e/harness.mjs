@@ -7,6 +7,8 @@
 // keys. None of that is observable without a real Chromium, real key events and
 // real focus. The file-browser page's module graph is in the same category: a
 // missing export or a stale reference is a runtime error nothing static catches.
+// So is HLS playback: whether hls.js, the server's synthetic playlist and the
+// on-demand segments agree only shows up with real MSE playing real segments.
 //
 // Run with `make e2e` from the repo root. Needs chromium, node and ffmpeg;
 // deliberately not part of `make check`, which must run anywhere.
@@ -77,6 +79,45 @@ function makeVideo(path, seconds) {
   }
 }
 
+// An mpegts recording whose clock starts at 5000s, like any broadcast capture:
+// h264 + aac, so the server remuxes it, and a non-zero start time, which is
+// what every raw PTS the server reads has to be rebased by. Long enough that a
+// seek can land past what hls.js has buffered.
+function makeRecording(path, seconds) {
+  const r = spawnSync("ffmpeg", [
+    "-y",
+    "-v",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    `testsrc2=size=320x180:rate=15:duration=${seconds}`,
+    "-f",
+    "lavfi",
+    "-i",
+    `sine=frequency=440:duration=${seconds}`,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-pix_fmt",
+    "yuv420p",
+    "-g",
+    "15",
+    "-c:a",
+    "aac",
+    "-shortest",
+    "-output_ts_offset",
+    "5000",
+    "-f",
+    "mpegts",
+    path,
+  ]);
+  if (r.status !== 0) {
+    throw new Error(`ffmpeg failed for ${path}: ${r.stderr}`);
+  }
+}
+
 console.log("building fixture…");
 makeVideo(join(media, "alpha.mp4"), 12);
 makeVideo(join(media, "beta.mp4"), 8);
@@ -87,6 +128,8 @@ writeFileSync(join(media, "gamma.mp4.part"), "partial\n");
 spawnSync("mkdir", ["-p", join(media, "sub", "nested")]);
 writeFileSync(join(media, "sub", "one.txt"), "one\n");
 writeFileSync(join(media, "sub", "two.txt"), "two\n");
+// Inside `nested`, whose own contents no listing check looks at.
+makeRecording(join(media, "sub", "nested", "rec.ts"), 90);
 
 const cfgPath = join(work, "config.json");
 writeFileSync(
@@ -173,7 +216,11 @@ try {
       consoleErrors.push(`request failed: ${r.url()}`);
     }
   });
+  // A check that provokes errors on purpose sets this to a URL pattern whose
+  // failures it expects, for its own duration.
+  let tolerated = null;
   page.on("response", (r) => {
+    if (tolerated && tolerated.test(r.url())) return;
     if (ours(r.url()) && r.status() >= 400) {
       consoleErrors.push(`HTTP ${r.status()} ${r.url()}`);
     }
@@ -557,6 +604,108 @@ try {
       helpClosed === true && page.url().includes("/player"),
     );
   }
+
+  // HLS needs hls.js, which comes from a CDN: offline, these are skipped
+  // rather than failed, like the CDN errors above.
+  section("player page: HLS");
+  const segRequests = [];
+  const onSegRequest = (r) => {
+    const m = r.url().match(/\/seg_(\d+)\.ts$/);
+    if (m) segRequests.push(Number(m[1]));
+  };
+  page.on("request", onSegRequest);
+  await page.goto(
+    `${BASE}/player?mount=0&path=${encodeURIComponent("sub/nested/rec.ts")}&t=20`,
+    { waitUntil: "domcontentloaded" },
+  );
+  const hlsAvailable = await page
+    .waitForFunction(() => window.Hls || window.__hlsjsFailed, {
+      timeout: 15000,
+    })
+    .then(() => page.evaluate(() => !!window.Hls && window.Hls.isSupported()))
+    .catch(() => false);
+  if (!hlsAvailable) {
+    console.log("  skip  hls.js unavailable (offline?) — HLS checks not run");
+  } else {
+    const playing = (past) =>
+      page
+        .waitForFunction(
+          (t) => document.getElementById("video").currentTime > t,
+          { timeout: 30000 },
+          past,
+        )
+        .then(() => true)
+        .catch(() => false);
+    const statusText = () => page.$eval("#status", (s) => s.textContent);
+
+    // The recording's PTS start at 5000s. Unrebased, every keyframe sat past
+    // the duration and the file fell back to a full transcode.
+    const started = await playing(21);
+    check(
+      "an mpegts recording with an offset clock remuxes and plays",
+      started && /^remux/.test(await statusText()),
+      await statusText(),
+    );
+    // Asking hls.js to start at ?t= directly: fetching segment 0 first made
+    // the server spawn a batch there only to kill it for the real position.
+    check(
+      "a ?t= start never fetches segment 0",
+      segRequests.length > 0 && !segRequests.includes(0),
+      `segments requested: ${segRequests.slice(0, 6).join(",")}`,
+    );
+
+    // A server restart or the idle reaper drops the session under a playing
+    // page; the next segment 404s and the player must reopen, not die.
+    tolerated = /\/api\/stream\/hls\//;
+    await page.evaluate(() => fetch("/api/stream/close", { method: "POST" }));
+    await page.$eval("#video", (v) => (v.currentTime = 75));
+    check(
+      "a lost session is reopened and playback carries on",
+      (await playing(76)) && /^remux/.test(await statusText()),
+      await statusText(),
+    );
+    tolerated = null;
+
+    // The server's direct verdict can't know this browser. Serve the direct
+    // request something no browser can decode: the player must fall back to
+    // HLS instead of sitting on a black frame.
+    await page.setRequestInterception(true);
+    const garbage = (r) => {
+      if (r.isInterceptResolutionHandled()) return;
+      if (r.url().includes("/api/stream/direct")) {
+        r.respond({
+          status: 200,
+          contentType: "video/mp4",
+          body: "not a video",
+        });
+      } else {
+        r.continue();
+      }
+    };
+    page.on("request", garbage);
+    await page.goto(
+      `${BASE}/player?mount=0&path=${encodeURIComponent("alpha.mp4")}`,
+      { waitUntil: "domcontentloaded" },
+    );
+    const fellBack = await page
+      .waitForFunction(
+        () =>
+          /direct play unsupported/.test(
+            document.getElementById("status").textContent,
+          ) && document.getElementById("video").currentTime > 0.5,
+        { timeout: 30000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    check(
+      "a direct file the browser rejects falls back to HLS",
+      fellBack,
+      await statusText(),
+    );
+    page.off("request", garbage);
+    await page.setRequestInterception(false);
+  }
+  page.off("request", onSegRequest);
 
   section("no stray errors overall");
   check(

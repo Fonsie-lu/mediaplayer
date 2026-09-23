@@ -80,6 +80,61 @@ var copyableAudio = map[string]bool{"aac": true, "mp3": true}
 // tmpfs spikes), so those fall back to a re-encode with forced keyframes.
 const remuxMaxSegment = 30.0
 
+// qualityHeights maps the player's quality selector to a height cap. Anything
+// else ("", "auto", "source") means the source resolution.
+var qualityHeights = map[string]int{"1080": 1080, "720": 720, "480": 480}
+
+// streamPlan is how a session will produce its segments: the whole
+// remux-vs-transcode decision, as a value.
+type streamPlan struct {
+	MaxHeight  int
+	AudioIdx   int
+	CopyAudio  bool
+	CopyVideo  bool      // remux mode
+	Boundaries []float64 // remux segment boundaries, from the source origin
+}
+
+func (p streamPlan) mode() string {
+	if p.CopyVideo {
+		return "remux"
+	}
+	return "transcode"
+}
+
+// planStream decides how to stream probe at quality q with the requested audio
+// track (audio-stream-relative, as the query string gave it; anything invalid
+// means the probed preference). keyframes supplies the source's keyframe times
+// measured from its origin, and is only called when remux is on the table —
+// it is the expensive part (a whole-file scan), which is also why it is a
+// parameter: everything else here is pure and tested without ffprobe.
+//
+// Remux needs video every browser decodes (8-bit 4:2:0 h264 — Hi10P shares
+// the codec name and decodes nowhere), no height cap, and a keyframe layout
+// that splits into segments of at most remuxMaxSegment. Anything else is
+// transcoded.
+func planStream(probe *transcode.ProbeResult, q, audio string, keyframes func() ([]float64, error)) streamPlan {
+	p := streamPlan{MaxHeight: qualityHeights[q], AudioIdx: probe.PreferredAudio}
+	if a, err := strconv.Atoi(audio); err == nil && a >= 0 && a < len(probe.AudioTracks) {
+		p.AudioIdx = a
+	}
+	if p.AudioIdx < len(probe.AudioTracks) {
+		p.CopyAudio = copyableAudio[probe.AudioTracks[p.AudioIdx].Codec]
+	}
+	if probe.VCodec != "h264" || !probe.BrowserDecodableVideo() || p.MaxHeight != 0 {
+		return p
+	}
+	kfs, err := keyframes()
+	if err != nil || len(kfs) == 0 {
+		return p // unscannable — re-encode instead
+	}
+	b := transcode.BuildBoundaries(kfs, probe.Duration, session.SegDuration)
+	if transcode.MaxGap(b) > remuxMaxSegment {
+		return p // keyframes too sparse to split on
+	}
+	p.CopyVideo, p.Boundaries = true, b
+	return p
+}
+
 // streamOpen registers a transcode session. No ffmpeg yet — segments are
 // produced on demand by streamHLS, so the client sees the full timeline
 // immediately and can seek anywhere.
@@ -88,14 +143,10 @@ const remuxMaxSegment = 30.0
 // (audio-stream-relative track index; defaults to the probed preference).
 // The legacy `t` (start seconds) is accepted for backward compat but
 // ignored: with VOD playlists the client seeks via standard HLS, not via a
-// re-spawn at offset.
-//
-// When the source video is h264 and no quality cap is requested, the
-// session runs in remux mode: video is stream-copied (bit-identical to the
-// source) and segments split on the source's own keyframes.
+// re-spawn at offset. See planStream for the remux-vs-transcode decision.
 func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
-	rel := r.URL.Query().Get("path")
-	q := r.URL.Query().Get("q")
+	query := r.URL.Query()
+	rel, q := query.Get("path"), query.Get("q")
 	_, full, ok := h.queryTarget(w, r)
 	if !ok {
 		return
@@ -109,40 +160,17 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "could not determine duration")
 		return
 	}
-	maxH := 0
-	switch q {
-	case "1080":
-		maxH = 1080
-	case "720":
-		maxH = 720
-	case "480":
-		maxH = 480
-	}
+	plan := planStream(probe, q, query.Get("audio"), func() ([]float64, error) {
+		return transcode.KeyframeTimes(full, probe.StartTime)
+	})
 
-	audioIdx := probe.PreferredAudio
-	if a, err := strconv.Atoi(r.URL.Query().Get("audio")); err == nil && a >= 0 && a < len(probe.AudioTracks) {
-		audioIdx = a
+	// Sessions are keyed by cookie and adopted in the order opens *finish*, and
+	// a keyframe scan can take minutes. An open whose client has already moved
+	// on (a quality switch, another video) must not land after the newer one
+	// and replace the session that page is playing.
+	if r.Context().Err() != nil {
+		return
 	}
-	copyAudio := false
-	if audioIdx < len(probe.AudioTracks) {
-		copyAudio = copyableAudio[probe.AudioTracks[audioIdx].Codec]
-	}
-
-	copyVideo := probe.VCodec == "h264" && maxH == 0
-	var bounds []float64
-	if copyVideo {
-		kfs, err := transcode.KeyframeTimes(full)
-		if err == nil && len(kfs) > 0 {
-			b := transcode.BuildBoundaries(kfs, probe.Duration, session.SegDuration)
-			if transcode.MaxGap(b) <= remuxMaxSegment {
-				bounds = b
-			}
-		}
-		if bounds == nil {
-			copyVideo = false // unusable keyframe layout — re-encode instead
-		}
-	}
-
 	sid := h.sid(w, r)
 	dir, err := os.MkdirTemp("", session.SessTempPrefix)
 	if err != nil {
@@ -150,28 +178,27 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess := &session.Session{
-		ID:         sid,
-		Input:      full,
-		Duration:   probe.Duration,
-		MaxHeight:  maxH,
-		AudioIdx:   audioIdx,
-		Dir:        dir,
-		CopyVideo:  copyVideo,
-		CopyAudio:  copyAudio,
-		Boundaries: bounds,
+		ID:          sid,
+		Input:       full,
+		Duration:    probe.Duration,
+		MaxHeight:   plan.MaxHeight,
+		AudioIdx:    plan.AudioIdx,
+		Dir:         dir,
+		Origin:      probe.StartTime,
+		Deinterlace: probe.Interlaced,
+		CopyVideo:   plan.CopyVideo,
+		CopyAudio:   plan.CopyAudio,
+		Boundaries:  plan.Boundaries,
 	}
 	h.Sessions.Adopt(sid, sess)
-	mode := "transcode"
-	if copyVideo {
-		mode = "remux"
-	}
-	log.Printf("[session %s] opened path=%s dur=%.1fs q=%s audio=%d mode=%s acopy=%t segs=%d dir=%s",
-		sid, rel, probe.Duration, q, audioIdx, mode, copyAudio, sess.NumSegments(), dir)
+	log.Printf("[session %s] opened path=%s dur=%.1fs q=%s audio=%d mode=%s acopy=%t deint=%t origin=%.3f segs=%d dir=%s",
+		sid, rel, probe.Duration, q, plan.AudioIdx, plan.mode(), plan.CopyAudio, sess.Deinterlace && !plan.CopyVideo,
+		probe.StartTime, sess.NumSegments(), dir)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session":  sid,
 		"playlist": "/api/stream/hls/" + sid + "/playlist.m3u8",
 		"duration": probe.Duration,
-		"mode":     mode,
+		"mode":     plan.mode(),
 	})
 }
 
@@ -225,6 +252,27 @@ func (h *Handler) streamHLS(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// Opened here rather than by path inside ServeFile: another request's batch
+	// start can evict or clear this segment at any moment (hls.js backtracking
+	// to n-1 clears n.. in remux mode). An open file survives its deletion; a
+	// file already gone is a 503, which hls.js retries — a 404 would read as
+	// "session lost" to the player and reopen the whole stream.
+	f, err := os.Open(path)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "segment was replaced, retry")
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "video/mp2t")
-	http.ServeFile(w, r, path)
+	// The URL is per cookie, not per video or per session instance: the same
+	// seg_00042.ts names a different file after a quality or audio switch, or
+	// on the next video. A cached copy — a Last-Modified invites heuristic
+	// caching — would splice the old one in.
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, file, st.ModTime(), f)
 }

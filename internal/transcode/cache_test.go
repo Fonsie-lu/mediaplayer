@@ -1,11 +1,16 @@
 package transcode
 
 import (
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestLRUEvictsOldestNotEverything(t *testing.T) {
@@ -132,5 +137,113 @@ func TestStatKey(t *testing.T) {
 
 	if got := statKey(filepath.Join(dir, "missing.mkv")); got != "" {
 		t.Errorf("statKey(missing) = %q, want empty so it isn't cached", got)
+	}
+}
+
+func (c *lru[V]) inflightLen() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.inflight)
+}
+
+// Concurrent loads of one key are one fn call: the player's probe and its
+// stream-open land together, and a duplicated keyframe scan reads the whole
+// file twice.
+func TestLRULoadSharesInflightCall(t *testing.T) {
+	c := newLRU[int](4)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	fn := func() (int, error) {
+		calls.Add(1)
+		<-release
+		return 42, nil
+	}
+	var wg sync.WaitGroup
+	results := make([]int, 8)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err := c.load("k", fn)
+			if err != nil {
+				t.Error(err)
+			}
+			results[i] = v
+		}()
+	}
+	// Let every goroutine reach load before the one call returns.
+	for c.inflightLen() == 0 {
+		runtime.Gosched()
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Errorf("fn ran %d times, want 1", got)
+	}
+	for i, v := range results {
+		if v != 42 {
+			t.Errorf("caller %d got %d, want the shared 42", i, v)
+		}
+	}
+	if v, ok := c.get("k"); !ok || v != 42 {
+		t.Error("loaded value not cached")
+	}
+}
+
+// A failed load reaches its callers but is not cached: the next call retries.
+func TestLRULoadDoesNotCacheErrors(t *testing.T) {
+	c := newLRU[int](4)
+	boom := errors.New("boom")
+	if _, err := c.load("k", func() (int, error) { return 0, boom }); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want boom", err)
+	}
+	v, err := c.load("k", func() (int, error) { return 7, nil })
+	if err != nil || v != 7 {
+		t.Errorf("retry = %d, %v; want 7", v, err)
+	}
+}
+
+// KeyframeTimes rebases the cached raw PTS onto the caller's origin, and hands
+// out a copy — the cache is shared, and the raw values must survive.
+func TestKeyframeTimesRebasesOntoOrigin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rec.ts")
+	if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keyframeCache.put(statKey(path), []float64{5001.4, 5003.4, 5005.4})
+
+	got, err := KeyframeTimes(path, 5001.4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []float64{0, 2, 4}
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("KeyframeTimes = %v, want %v", got, want)
+		}
+	}
+	got[0] = -1
+	if again, _ := KeyframeTimes(path, 0); again[0] != 5001.4 {
+		t.Errorf("caller's edit reached the cache: %v", again)
+	}
+}
+
+// A panicking load must reach its caller as a panic and leave nothing cached:
+// before the completed flag, the deferred cleanup stored the zero value as a
+// successful result.
+func TestLRULoadPanicNotCached(t *testing.T) {
+	c := newLRU[*int](4)
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = c.load("k", func() (*int, error) { panic("boom") })
+	}()
+	if _, ok := c.get("k"); ok {
+		t.Fatal("a panicked load was cached")
+	}
+	v := 3
+	got, err := c.load("k", func() (*int, error) { return &v, nil })
+	if err != nil || got == nil || *got != 3 {
+		t.Errorf("reload after panic = %v, %v; want 3", got, err)
 	}
 }

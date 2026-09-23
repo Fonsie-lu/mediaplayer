@@ -1,8 +1,14 @@
 package api
 
 import (
+	"encoding/json"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
+
+	"mediaplayer/internal/config"
 )
 
 func names(e []FileEntry) []string {
@@ -84,5 +90,48 @@ func TestSortEntriesAllKeys(t *testing.T) {
 		if got := names(e); !slices.Equal(got, want) {
 			t.Errorf("sort %q: got %v, want %v", by, got, want)
 		}
+	}
+}
+
+// A symlinked folder inside the mount must list — and therefore open — as a
+// folder; a link leaving the mount keeps the link's own info rather than
+// reporting on a host file the mount was never meant to expose.
+func TestBrowseFollowsInMountSymlinks(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.Mkdir(filepath.Join(root, "real"), 0o755))
+	must(os.WriteFile(filepath.Join(root, "film.mkv"), make([]byte, 1000), 0o644))
+	must(os.WriteFile(filepath.Join(outside, "secret.mkv"), make([]byte, 5000), 0o644))
+	must(os.Symlink("real", filepath.Join(root, "linkdir")))
+	must(os.Symlink("film.mkv", filepath.Join(root, "linkfilm.mkv")))
+	must(os.Symlink(filepath.Join(outside, "secret.mkv"), filepath.Join(root, "escape.mkv")))
+
+	h := &Handler{Cfg: config.New(config.Snapshot{Mounts: []config.Mount{{Name: "m", Path: root}}})}
+	rec := httptest.NewRecorder()
+	h.browse(rec, httptest.NewRequest("GET", "/api/browse?mount=0&path=", nil))
+	var res struct{ Entries []FileEntry }
+	must(json.Unmarshal(rec.Body.Bytes(), &res))
+	byName := map[string]FileEntry{}
+	for _, e := range res.Entries {
+		byName[e.Name] = e
+	}
+
+	if e := byName["linkdir"]; !e.IsDir || e.Kind != "folder" {
+		t.Errorf("linkdir = %+v, want a folder", e)
+	}
+	if e := byName["linkfilm.mkv"]; e.Size != 1000 {
+		t.Errorf("linkfilm.mkv size = %d, want the target's 1000", e.Size)
+	}
+	if e := byName["escape.mkv"]; e.Size == 5000 {
+		t.Error("escape.mkv reports the size of a file outside the mount")
+	}
+	if names(res.Entries)[0] != "linkdir" {
+		t.Errorf("order = %v, want the linked folder sorted with the folders", names(res.Entries))
 	}
 }

@@ -1,6 +1,7 @@
 package transcode
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -62,8 +64,10 @@ type Batch struct {
 	// (encode mode) renames segments into place atomically instead.
 	Sequential bool
 
-	done chan struct{}
-	once sync.Once
+	started  time.Time   // before ffmpeg ran: older files in range predate it
+	stopping atomic.Bool // Stop was called; see Stopping
+	done     chan struct{}
+	once     sync.Once
 }
 
 // BatchSpec describes one ffmpeg batch.
@@ -83,6 +87,17 @@ type BatchSpec struct {
 	MaxHeight int // 0 = keep source resolution (encode mode only)
 	AudioIdx  int // audio-stream-relative index to map
 
+	// Origin is the source's container start_time (ProbeResult.StartTime).
+	// Every time in a spec — StartSec, SplitTimes, the playlist — is measured
+	// from it, because that is what -ss counts from; the landing probes see
+	// raw PTS and subtract it. Zero-ish for Matroska/mp4, the broadcast clock
+	// for an mpegts recording.
+	Origin float64
+
+	// Deinterlace (encode mode only) runs the video through bwdif first.
+	// Browsers display interlaced frames as-is, combing and all.
+	Deinterlace bool
+
 	// CopyVideo enables remux mode: the source h264 stream is copied
 	// bit-for-bit and segments split on existing keyframes. CopyAudio
 	// likewise passes the audio stream through (codec must be valid in
@@ -90,8 +105,8 @@ type BatchSpec struct {
 	CopyVideo bool
 	CopyAudio bool
 
-	// SplitTimes (remux mode) are the absolute source times of the batch's
-	// internal segment boundaries — keyframe timestamps for segments
+	// SplitTimes (remux mode) are the source times (from Origin) of the
+	// batch's internal segment boundaries — keyframe timestamps for segments
 	// StartSeg+1 .. StartSeg+Count-1.
 	SplitTimes []float64
 }
@@ -136,7 +151,7 @@ func planBatch(spec BatchSpec) batchPlan {
 	p := batchPlan{seekAt: spec.StartSec, anchor: spec.StartSec}
 	if spec.CopyVideo {
 		if s, l, ok := correctSeek(spec.StartSec, func(at float64) (float64, error) {
-			return probeLanding(spec.Input, spec.Dir, at)
+			return probeLanding(spec.Input, at, spec.Origin)
 		}); ok {
 			p.seekAt = s
 			if l > spec.StartSec+landingSlop {
@@ -149,7 +164,7 @@ func planBatch(spec BatchSpec) batchPlan {
 	}
 	if spec.StartSec > 0 {
 		if s, l, ok := correctSeek(spec.StartSec, func(at float64) (float64, error) {
-			return keyframeLanding(spec.Input, at)
+			return keyframeLanding(spec.Input, at, spec.Origin)
 		}); ok {
 			p.seekAt = s
 			if l > spec.StartSec+landingSlop {
@@ -161,6 +176,18 @@ func planBatch(spec BatchSpec) batchPlan {
 	}
 	return p
 }
+
+// timelinePad is added to every batch's output timestamps, so that none of
+// them can go negative. B-frames give an h264 stream (copied or x264's own)
+// a first DTS a frame or two *before* its first PTS, and AAC priming puts the
+// first audio packet 21ms early. On a batch whose timeline starts at 0 — the
+// batch at the head of the video, and no other — those came out negative,
+// make_non_negative shifted that batch alone ~80-170ms late, and its seam
+// with the next batch played as an overlap. Players map a stream's PTS onto
+// the playlist from the first fragment they load, so a constant offset is
+// invisible to them; only a per-batch one is not. Anything comfortably above
+// a GOP's decode delay would do.
+const timelinePad = 10.0
 
 // batchArgs builds ffmpeg's full argument list for spec under plan. Pure: no
 // filesystem access, no subprocesses — the streaming path's trickiest logic
@@ -203,7 +230,15 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 		// output back to exactly StartSec; setpts shifts the timeline so the
 		// downstream args (-t, force_key_frames, -output_ts_offset) see the
 		// same 0-at-StartSec timebase as the no-backoff path.
+		//
+		// Deinterlacing goes first, on the source frames: bwdif is temporal,
+		// so it wants its neighbours before the trim discards any. deint=
+		// interlaced leaves frames not flagged as interlaced untouched, which
+		// makes it safe on streams that mix the two (DVB ad breaks).
 		var vf []string
+		if spec.Deinterlace {
+			vf = append(vf, "bwdif=mode=send_frame:deint=interlaced")
+		}
 		if backoff > 0 {
 			vf = append(vf,
 				fmt.Sprintf("trim=start=%.3f", backoff),
@@ -234,7 +269,8 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 	}
 	// Restore the global timeline: input timestamps were shifted down by the
 	// -ss value (and by the trim/setpts backoff in encode mode), adding it
-	// back makes every batch's PTS equal the source's.
+	// back makes every batch's PTS equal the source's — plus timelinePad, the
+	// same for every batch, so all batches still share one timeline.
 	//
 	// -muxdelay 0 plus make_non_negative stops mpegts from adding its default
 	// 1.4s start offset. Without this, every segment's content begins 1.4s
@@ -245,6 +281,7 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 	if !spec.CopyVideo {
 		tsOffset = spec.StartSec // encode: timeline is 0 at StartSec post-trim
 	}
+	tsOffset += timelinePad
 	args = append(args,
 		"-output_ts_offset", strconv.FormatFloat(tsOffset, 'f', 3, 64),
 		"-muxdelay", "0",
@@ -327,41 +364,56 @@ func StartBatch(spec BatchSpec) (*Batch, error) {
 
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if logFile, err := os.Create(filepath.Join(spec.Dir, fmt.Sprintf("ffmpeg-%05d.log", spec.StartSeg))); err == nil {
+	logPath := filepath.Join(spec.Dir, fmt.Sprintf("ffmpeg-%05d.log", spec.StartSeg))
+	if logFile, err := os.Create(logPath); err == nil {
 		cmd.Stderr = logFile
 		cmd.Stdout = logFile
+		defer logFile.Close() // the child holds its own descriptor
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
 	b := &Batch{
 		Dir:        spec.Dir,
 		StartSeg:   spec.StartSeg,
 		Count:      spec.Count,
 		Cmd:        cmd,
 		Sequential: spec.CopyVideo,
+		started:    time.Now(),
 		done:       make(chan struct{}),
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
 	}
 	go func() {
 		werr := cmd.Wait()
 		if werr != nil {
-			// non-zero exit is expected on Stop (we SIGKILL); don't spam logs
-			if _, ok := werr.(*exec.ExitError); !ok {
+			var exit *exec.ExitError
+			switch {
+			case !errors.As(werr, &exit):
 				log.Printf("ffmpeg batch [%d..%d] wait: %v", spec.StartSeg, spec.StartSeg+spec.Count-1, werr)
+			case !b.stopping.Load():
+				// Not our signal, so ffmpeg itself gave up. Its log is in a
+				// session dir that is about to be deleted; its last line is
+				// what explains the failure.
+				log.Printf("ffmpeg batch [%d..%d] failed (%v): %s", spec.StartSeg, spec.StartSeg+spec.Count-1,
+					werr, lastLine(logPath))
 			}
-			if b.Sequential {
-				// The segment muxer writes files in place (no temp_file
-				// rename), so an interrupted run leaves its in-progress
-				// segment truncated on disk. It is the highest-numbered one
-				// this batch produced — drop it before waiters re-check,
-				// or a later request would serve it as a cached segment.
-				b.removeNewestSegment()
-			}
+			// Whatever ended it, the segment it was writing may be cut short
+			// under its final name — drop it before waiters re-check.
+			b.discardPartial()
 		}
 		close(b.done)
 	}()
 	return b, nil
+}
+
+// lastLine returns the last non-empty line of the file at path, or "" when it
+// can't be read.
+func lastLine(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 const (
@@ -404,49 +456,100 @@ func correctSeek(want float64, probe func(float64) (float64, error)) (seekAt, la
 	return seekAt, l, true
 }
 
-// probeLanding reports the PTS of the keyframe a stream-copy `-ss target`
-// actually lands on: ffmpeg seeks the same way the batch will, copies a
-// single video frame with timestamps preserved, and we read its PTS back.
-// Matroska seeks land on cue points, which can be one or more keyframes
-// before the target.
-func probeLanding(input, dir string, target float64) (float64, error) {
-	tmp := filepath.Join(dir, ".landing.ts")
-	defer os.Remove(tmp)
-	probe := exec.Command("ffmpeg", "-y", "-v", "error",
+// landingProbeTimeout bounds each landing probe. They run while the session
+// holds its batch-start lock, so one hung on a stalled mount would wedge every
+// later seek in that session; a healthy probe takes tens of milliseconds.
+const landingProbeTimeout = 20 * time.Second
+
+// probeLanding reports where a stream-copy `-ss target` actually lands, as a
+// time measured from origin: ffmpeg seeks exactly the way the batch will,
+// copies a single video frame with timestamps preserved, and prints it as a
+// framecrc line — the packet's raw PTS plus its stream timebase — to stdout.
+// Matroska seeks land on cue points, which can be one or more keyframes before
+// the target.
+//
+// framecrc keeps this to one process with no scratch file. It used to be an
+// ffmpeg run writing a one-frame .ts and an ffprobe run reading it back: two
+// more opens of the source over a possibly slow mount, per probe, up to
+// 1+maxSeekTries probes per seek.
+func probeLanding(input string, target, origin float64) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), landingProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ffmpeg", "-v", "error",
 		"-ss", strconv.FormatFloat(target, 'f', 3, 64),
 		"-i", input,
 		"-map", "0:v:0",
 		"-c", "copy",
 		"-frames:v", "1",
 		"-copyts",
-		"-muxdelay", "0",
 		"-avoid_negative_ts", "disabled",
-		"-f", "mpegts", tmp,
-	)
-	if err := probe.Run(); err != nil {
-		return 0, err
-	}
-	out, err := exec.Command("ffprobe", "-v", "error",
-		"-select_streams", "v:0",
-		"-show_entries", "packet=pts_time",
-		"-of", "csv=p=0", tmp,
+		"-f", "framecrc", "-",
 	).Output()
 	if err != nil {
 		return 0, err
 	}
-	first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
-	return strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(first), ","), 64)
+	pts, err := parseFramecrcPTS(string(out))
+	if err != nil {
+		return 0, err
+	}
+	return pts - origin, nil
 }
 
-// keyframeLanding reports the PTS of the first keyframe-flagged video packet
-// at or after where a seek to target lands — i.e. the earliest point an
-// encode batch's decoded output can begin. Demux-only (no decoding), so it
-// costs a few tens of milliseconds. Containers with a keyframe index land at
-// a keyframe at/before target; index-less ones (mpegts) can land mid-GOP,
-// putting the first decodable frame after target.
-func keyframeLanding(input string, target float64) (float64, error) {
-	out, err := exec.Command("ffprobe", "-v", "error",
-		"-read_intervals", strconv.FormatFloat(target, 'f', 3, 64)+"%+#2000",
+// parseFramecrcPTS reads the first packet's PTS, in seconds, out of framecrc
+// output: a "#tb 0: num/den" header, then one
+// "stream, dts, pts, duration, size, crc[, side data…]" line per packet with
+// timestamps in that timebase.
+func parseFramecrcPTS(out string) (float64, error) {
+	num, den := int64(0), int64(0)
+	for line := range strings.Lines(out) {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "#tb 0:"); ok {
+			n, d, ok := strings.Cut(strings.TrimSpace(rest), "/")
+			if !ok {
+				return 0, fmt.Errorf("framecrc: bad timebase %q", rest)
+			}
+			var err1, err2 error
+			num, err1 = strconv.ParseInt(n, 10, 64)
+			den, err2 = strconv.ParseInt(d, 10, 64)
+			if err1 != nil || err2 != nil || den == 0 {
+				return 0, fmt.Errorf("framecrc: bad timebase %q", rest)
+			}
+			continue
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) < 3 || den == 0 {
+			return 0, fmt.Errorf("framecrc: unexpected line %q", line)
+		}
+		pts, err := strconv.ParseInt(strings.TrimSpace(fields[2]), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("framecrc: bad pts in %q", line)
+		}
+		return float64(pts) * float64(num) / float64(den), nil
+	}
+	return 0, errors.New("framecrc: no packet")
+}
+
+// keyframeLanding reports the first keyframe-flagged video packet at or after
+// where a seek to target lands, measured from origin — i.e. the earliest
+// point an encode batch's decoded output can begin. Demux-only (no decoding),
+// so it costs a few tens of milliseconds. Containers with a keyframe index
+// land at a keyframe at/before target; index-less ones (mpegts) can land
+// mid-GOP, putting the first decodable frame after target.
+//
+// The interval is given in its "+offset" form, which ffprobe measures from the
+// container start the same way ffmpeg's -ss does. The bare form is an absolute
+// PTS: for an mpegts recording whose clock starts at, say, 5000s, every seek
+// resolved to the head of the file, the back-off walk gave up at 0, and each
+// batch decoded — and threw away — everything from the start of the recording
+// up to the seek point.
+func keyframeLanding(input string, target, origin float64) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), landingProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error",
+		"-read_intervals", "+"+strconv.FormatFloat(target, 'f', 3, 64)+"%+#2000",
 		"-select_streams", "v:0",
 		"-show_entries", "packet=pts_time,flags",
 		"-of", "csv=p=0", input,
@@ -454,28 +557,57 @@ func keyframeLanding(input string, target float64) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Split(strings.TrimSpace(line), ",")
-		if len(fields) < 2 || !strings.Contains(fields[1], "K") {
+	pts, err := firstKeyframePTS(string(out))
+	if err != nil {
+		return 0, err
+	}
+	return pts - origin, nil
+}
+
+// firstKeyframePTS returns the first keyframe-flagged entry of ffprobe's
+// `pts_time,flags` CSV.
+func firstKeyframePTS(out string) (float64, error) {
+	for line := range strings.Lines(out) {
+		ptsStr, flags, ok := strings.Cut(strings.TrimSpace(line), ",")
+		if !ok || !strings.Contains(flags, "K") {
 			continue
 		}
-		if pts, err := strconv.ParseFloat(fields[0], 64); err == nil {
+		if pts, err := strconv.ParseFloat(ptsStr, 64); err == nil {
 			return pts, nil
 		}
 	}
 	return 0, errors.New("no keyframe within probe window")
 }
 
-// removeNewestSegment deletes the highest-numbered segment file in this
-// batch's range. Called when a sequential (segment-muxer) batch exits
-// abnormally, since its newest file may be truncated mid-write.
-func (b *Batch) removeNewestSegment() {
-	for n := b.StartSeg + b.Count - 1; n >= b.StartSeg; n-- {
+// discardPartial deletes what an interrupted batch may have left half-written:
+// the last segment file it wrote, and any temp file of the hls muxer's.
+//
+// Both muxers can leave one. The segment muxer writes in place, so its
+// in-progress file is simply truncated. The hls muxer's temp_file flag does not
+// save it either: on SIGTERM ffmpeg writes its trailer, and the trailer renames
+// the in-progress segment into place — a 0.8s file under a name the playlist
+// says is 4s, which encode mode's "present = complete" rule would then serve,
+// leaving a hole in the player's buffer. (Only a SIGKILL leaves it as .tmp.)
+//
+// "Last written" is the newest mtime in the batch's range, not the highest
+// index: encode mode doesn't clear its range first, so files from earlier
+// batches can sit above the one this batch was writing. Anything older than
+// the batch's start is one of those and is left alone. Deleting a segment that
+// was in fact complete is harmless — it is regenerated on demand.
+func (b *Batch) discardPartial() {
+	newest, newestAt := "", b.started
+	for n := b.StartSeg; n < b.StartSeg+b.Count; n++ {
 		p := filepath.Join(b.Dir, SegName(n))
-		if _, err := os.Stat(p); err == nil {
-			_ = os.Remove(p)
-			return
+		if st, err := os.Stat(p); err == nil && !st.ModTime().Before(newestAt) {
+			newest, newestAt = p, st.ModTime()
 		}
+	}
+	if newest != "" {
+		_ = os.Remove(newest)
+	}
+	tmps, _ := filepath.Glob(filepath.Join(b.Dir, "seg_*.ts.tmp"))
+	for _, p := range tmps {
+		_ = os.Remove(p)
 	}
 }
 
@@ -487,7 +619,14 @@ func (b *Batch) Contains(n int) bool {
 // Done is closed when ffmpeg exits.
 func (b *Batch) Done() <-chan struct{} { return b.done }
 
-// Finished reports whether ffmpeg has exited, without blocking.
+// Stopping reports whether Stop has been called. From then until Finished, no
+// file in the batch's range can be trusted: ffmpeg's signal handling may still
+// be finalizing a partial segment, and exit cleanup (discardPartial) has not
+// run yet.
+func (b *Batch) Stopping() bool { return b.stopping.Load() }
+
+// Finished reports whether ffmpeg has exited, without blocking. Exit cleanup
+// has run by then.
 func (b *Batch) Finished() bool {
 	select {
 	case <-b.done:
@@ -497,10 +636,13 @@ func (b *Batch) Finished() bool {
 	}
 }
 
-// Stop signals the batch's ffmpeg process group: SIGTERM first so any
-// in-flight segment write gets flushed/closed (releasing tmpfs pages),
-// SIGKILL after a short grace period if it hasn't exited.
+// Stop signals the batch's ffmpeg process group: SIGTERM first so ffmpeg
+// closes its files, SIGKILL after a short grace period if it hasn't exited.
+// Either way the segment it was writing is incomplete, and exit cleanup
+// (discardPartial) removes it; Stopping covers the window until then. Stop
+// returns once ffmpeg has exited, or after the grace periods run out.
 func (b *Batch) Stop() {
+	b.stopping.Store(true)
 	b.once.Do(func() {
 		if b.Cmd == nil || b.Cmd.Process == nil {
 			return

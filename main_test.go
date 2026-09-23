@@ -59,3 +59,35 @@ func TestStaticRoutes(t *testing.T) {
 		}
 	}
 }
+
+// Embedded files carry no modification time, so without an ETag a browser can
+// only re-download them; with one, a page hop revalidates to a 304.
+func TestStaticAssetsRevalidate(t *testing.T) {
+	mux := testServerMux(t)
+	for _, target := range []string{"/", "/player", "/js/player.js", "/css/browser.css"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", target, nil))
+		tag := rec.Header().Get("ETag")
+		if tag == "" {
+			t.Errorf("GET %s: no ETag", target)
+			continue
+		}
+		req := httptest.NewRequest("GET", target, nil)
+		req.Header.Set("If-None-Match", tag)
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Errorf("GET %s with its own ETag: status %d, want 304", target, rec.Code)
+		}
+	}
+	// The two pages are different files and must not share a validator.
+	tags := map[string]string{}
+	for _, target := range []string{"/", "/player"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", target, nil))
+		tags[target] = rec.Header().Get("ETag")
+	}
+	if tags["/"] == tags["/player"] {
+		t.Error("browser and player pages share an ETag")
+	}
+}

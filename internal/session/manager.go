@@ -28,6 +28,11 @@ const (
 var (
 	ErrSegmentTimeout = errors.New("timed out waiting for segment")
 	ErrSessionClosed  = errors.New("session closed")
+	// ErrBatchStuck means a stopped ffmpeg outlived SIGKILL (a process stuck
+	// in uninterruptible I/O on a stalled mount). Nothing new may start in
+	// the session dir until it exits, or its exit cleanup would delete the
+	// new batch's files; the request fails and the player's retry tries again.
+	ErrBatchStuck = errors.New("previous ffmpeg batch has not exited")
 )
 
 // Session represents one client's transcode state. With VOD-style playlists,
@@ -41,6 +46,12 @@ type Session struct {
 	AudioIdx  int // audio-stream-relative index; ffprobe picks English when present
 	Dir       string
 
+	// Origin is the source's container start time; see transcode.BatchSpec.
+	// Duration, Boundaries and every playlist position are measured from it.
+	Origin float64
+	// Deinterlace applies to encode mode; see transcode.BatchSpec.
+	Deinterlace bool
+
 	// CopyVideo enables remux mode: segments are stream-copied and split on
 	// source keyframes, so Boundaries (NumSegments+1 ascending times, first 0,
 	// last Duration) replaces the uniform SegDuration grid. Boundaries nil =
@@ -49,8 +60,14 @@ type Session struct {
 	CopyAudio  bool
 	Boundaries []float64
 
-	mu         sync.Mutex
-	batch      *transcode.Batch
+	mu    sync.Mutex
+	batch *transcode.Batch
+	// retiring is the batch startBatchAt is stopping, from the moment it stops
+	// being s.batch until its ffmpeg has exited and cleaned up. Files in its
+	// range are not trustworthy meanwhile (see transcode.Batch.Stopping), and
+	// without this field a request arriving in that window would see no batch
+	// at all and serve whatever half-written segment it found.
+	retiring   *transcode.Batch
 	closed     bool
 	lastAccess time.Time
 
@@ -131,10 +148,11 @@ func (s *Session) PlaylistText() string {
 // Players don't request segments strictly in order — hls.js backtracks to
 // n-1 after seeks and may pipeline n+1 — so concurrent requests can replace
 // the session's batch out from under each other (a request for n-1 stops a
-// batch that just started at n). Each waiter therefore loops: when the
-// batch it was watching goes away, it re-evaluates the session state
-// instead of failing, because the replacement batch usually covers its
-// segment too.
+// batch that just started at n). Each waiter therefore loops: whenever the
+// batch it was watching exits or goes away, it re-evaluates the session state
+// under the lock instead of failing, because the replacement batch usually
+// covers its segment too. The completeness decision is made only there, against
+// the session's current and retiring batches, never against a stale one.
 //
 // ctx is the client request's context. A waiter whose client has gone away
 // (hls.js aborts in-flight segment loads on seeks and timeouts) must never
@@ -157,29 +175,35 @@ func (s *Session) EnsureSegment(ctx context.Context, n int) (string, error) {
 		}
 		s.lastAccess = time.Now()
 		b := s.batch
-		// Complete on disk? Mind that a sequential (remux) batch writes in
-		// place, so a present file it is still producing may be truncated.
-		if segmentComplete(s.Dir, n, b) {
+		// Read before the completeness check, not after: a batch finishing in
+		// between would otherwise read as "exited without n" when its exit is
+		// exactly what just completed n (a remux batch's last segment).
+		finished := b != nil && b.Finished()
+		if segmentComplete(s.Dir, n, b, s.retiring) {
 			s.mu.Unlock()
 			return segPath(s.Dir, n), nil
 		}
-		// Being produced (or about to be) by the active batch? Wait for it.
 		if b != nil && b.Contains(n) {
 			s.mu.Unlock()
-			path, err := waitForSegment(ctx, s.Dir, n, b, time.Until(deadline))
-			if err == nil {
-				return path, nil
+			if finished {
+				// The session's own batch covered n and had already exited
+				// (cleanup included) when n was found missing: ffmpeg gave up
+				// before reaching it, or n was the cut-short segment its exit
+				// cleanup removed. One batch started exactly at n is worth a
+				// try; if that one fails too, so does the request — which
+				// bounds the retries to one spawn per failing segment.
+				if b.StartSeg == n {
+					return "", fmt.Errorf("ffmpeg exited without producing %s", transcode.SegName(n))
+				}
+				s.mu.Lock()
+				if s.batch == b {
+					s.batch = nil // no process left to stop
+				}
+				s.mu.Unlock()
+				continue
 			}
-			if errors.Is(err, ErrSegmentTimeout) || ctx.Err() != nil {
-				return "", err
-			}
-			// The batch exited without the segment. If it is still the
-			// session's current batch, ffmpeg genuinely failed — give up.
-			// Otherwise another request replaced it; re-evaluate.
-			s.mu.Lock()
-			replaced := s.batch != b
-			s.mu.Unlock()
-			if !replaced {
+			// Being produced by the active batch: wait, then re-check here.
+			if err := waitForSegment(ctx, s.Dir, n, b, time.Until(deadline)); err != nil {
 				return "", err
 			}
 			continue
@@ -220,21 +244,53 @@ func (s *Session) startBatchAt(ctx context.Context, n int) error {
 		return ErrSessionClosed
 	}
 	prev := s.batch
-	if segmentComplete(s.Dir, n, prev) || (prev != nil && prev.Contains(n)) {
+	if segmentComplete(s.Dir, n, prev, s.retiring) || (prev != nil && prev.Contains(n)) {
 		s.mu.Unlock()
 		return errRetry
 	}
-	s.batch = nil
-	s.mu.Unlock()
-
-	if ctx.Err() != nil {
+	if s.retiring != nil {
+		// Only possible when an earlier stop gave up on a process that
+		// wouldn't die; see ErrBatchStuck.
+		s.mu.Unlock()
+		return ErrBatchStuck
+	}
+	if err := ctx.Err(); err != nil {
 		// Client gone — don't spawn a batch nobody will consume. It would stop
 		// the batch a live request is waiting on, and the two would kill each
-		// other's ffmpeg until the deadline.
-		return ctx.Err()
+		// other's ffmpeg until the deadline. Checked before prev is detached:
+		// bailing out after that would orphan a live ffmpeg that nothing
+		// stops, and the next spawn would run a second one into the same dir.
+		s.mu.Unlock()
+		return err
 	}
+	s.batch, s.retiring = nil, prev
+	s.mu.Unlock()
+
 	if prev != nil {
 		prev.Stop()
+		if !prev.Finished() {
+			// Stop's grace periods ran out with ffmpeg still alive. Keep it
+			// retiring — its files stay untrusted and no new batch may start
+			// beside it — until it does exit.
+			go func() {
+				<-prev.Done()
+				s.mu.Lock()
+				if s.retiring == prev {
+					s.retiring = nil
+				}
+				s.mu.Unlock()
+			}()
+			return ErrBatchStuck
+		}
+		s.mu.Lock()
+		s.retiring = nil
+		s.mu.Unlock()
+	}
+	if err := ctx.Err(); err != nil {
+		// Checked again now that prev is gone: stopping it can take the best
+		// part of a second, and a client that left meanwhile shouldn't start
+		// a batch. Nothing is orphaned by bailing out here.
+		return err
 	}
 	s.evictOutsideWindow(n)
 
@@ -248,10 +304,13 @@ func (s *Session) startBatchAt(ctx context.Context, n int) error {
 			_ = os.Remove(segPath(s.Dir, i))
 		}
 	}
+	started := time.Now()
 	nb, err := transcode.StartBatch(spec)
 	if err != nil {
 		return err
 	}
+	log.Printf("[session %s] batch seg %d..%d from %.2fs (spawned in %s)", s.ID,
+		spec.StartSeg, spec.StartSeg+spec.Count-1, spec.StartSec, time.Since(started).Round(time.Millisecond))
 
 	s.mu.Lock()
 	if s.closed {
@@ -284,18 +343,20 @@ func (s *Session) batchSpecFor(n int) transcode.BatchSpec {
 		}
 	}
 	return transcode.BatchSpec{
-		Input:      s.Input,
-		Dir:        s.Dir,
-		StartSeg:   n,
-		Count:      count,
-		StartSec:   s.segStart(n),
-		DurSec:     s.segStart(n+count) - s.segStart(n),
-		SegDur:     SegDuration,
-		MaxHeight:  s.MaxHeight,
-		AudioIdx:   s.AudioIdx,
-		CopyVideo:  s.CopyVideo,
-		CopyAudio:  s.CopyAudio,
-		SplitTimes: splits,
+		Input:       s.Input,
+		Dir:         s.Dir,
+		StartSeg:    n,
+		Count:       count,
+		StartSec:    s.segStart(n),
+		DurSec:      s.segStart(n+count) - s.segStart(n),
+		SegDur:      SegDuration,
+		MaxHeight:   s.MaxHeight,
+		AudioIdx:    s.AudioIdx,
+		Origin:      s.Origin,
+		Deinterlace: s.Deinterlace,
+		CopyVideo:   s.CopyVideo,
+		CopyAudio:   s.CopyAudio,
+		SplitTimes:  splits,
 	}
 }
 
@@ -303,29 +364,51 @@ func segPath(dir string, n int) string {
 	return filepath.Join(dir, transcode.SegName(n))
 }
 
-// segmentComplete reports whether seg_<n>.ts exists and is fully written.
-// Files from encode batches appear atomically (hls muxer temp_file rename),
-// so presence means complete. A sequential (remux) batch writes in place:
-// while it is alive and n is in its range, the file is only complete once
-// its successor has been opened; once the batch has exited, every file it
-// left behind is complete (an abnormal exit removes its truncated tail).
-func segmentComplete(dir string, n int, b *transcode.Batch) bool {
+// segmentComplete reports whether seg_<n>.ts exists and is fully written,
+// given every batch that may still be writing it: the session's current batch
+// and, while one is being stopped, the retiring one. Nil batches are skipped.
+func segmentComplete(dir string, n int, batches ...*transcode.Batch) bool {
 	st, err := os.Stat(segPath(dir, n))
 	if err != nil || st.Size() == 0 {
 		return false
 	}
-	if b == nil || !b.Sequential || !b.Contains(n) || b.Finished() {
+	for _, b := range batches {
+		if mayBeWriting(dir, n, b) {
+			return false
+		}
+	}
+	return true
+}
+
+// mayBeWriting reports whether batch b may still be writing segment n, so a
+// file present under that name can't be trusted yet.
+//
+// Files from encode batches appear atomically (hls muxer temp_file rename), so
+// presence means complete. A sequential (remux) batch writes in place: while it
+// is alive and n is in its range, the file is only complete once its successor
+// has been opened. A batch being stopped is trusted for nothing in its range
+// until it has exited, since both muxers can leave a cut-short final segment
+// that exit cleanup then removes. Once a batch has exited, every file it left
+// behind is complete.
+func mayBeWriting(dir string, n int, b *transcode.Batch) bool {
+	if b == nil || !b.Contains(n) || b.Finished() {
+		return false
+	}
+	if b.Stopping() {
 		return true
 	}
+	if !b.Sequential {
+		return false
+	}
 	if b.Contains(n + 1) {
-		// The batch clears its range before starting, so a successor file
+		// A remux batch clears its range before starting, so a successor file
 		// can only have been written — sequentially, after closing n — by
 		// this batch.
-		_, err = os.Stat(segPath(dir, n+1))
-		return err == nil
+		_, err := os.Stat(segPath(dir, n+1))
+		return err != nil
 	}
 	// n is the batch's last segment — only process exit guarantees a flush.
-	return false
+	return true
 }
 
 // evictOutsideWindow deletes cached .ts files outside [n-WindowBack, n+WindowAhead].
@@ -348,46 +431,29 @@ func (s *Session) evictOutsideWindow(n int) {
 	}
 }
 
-// waitForSegment polls for segment n to be complete. Aborts early if the
-// generating batch exits without producing it (ffmpeg failed or was killed)
-// or the client request is cancelled.
-//
-// Completion criteria depend on the muxer: encode batches (hls muxer,
-// temp_file flag) rename segments into place atomically, so existing =
-// complete. Remux batches (segment muxer, Sequential) write in place, so a
-// segment is only complete once its successor file has been opened or
-// ffmpeg has exited — until then it may still be growing.
-func waitForSegment(ctx context.Context, dir string, n int, b *transcode.Batch, timeout time.Duration) (string, error) {
-	path := segPath(dir, n)
-	deadline := time.Now().Add(timeout)
+// waitForSegment polls until segment n looks complete as far as batch b is
+// concerned, or b exits. Either way it returns nil and the caller re-evaluates
+// under the session lock: that is where completeness is decided, against the
+// session's current state rather than a batch that may have been replaced
+// meanwhile. The errors are the two that end the wait for good — the client
+// going away (ctx) and the deadline.
+func waitForSegment(ctx context.Context, dir string, n int, b *transcode.Batch, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
-	batchExited := false
-	for {
-		if segmentComplete(dir, n, b) {
-			return path, nil
-		}
-		if batchExited {
-			// One more check after exit, then give up. After exit every
-			// produced file is closed (an interrupted sequential batch
-			// already dropped its truncated tail).
-			time.Sleep(50 * time.Millisecond)
-			if segmentComplete(dir, n, b) {
-				return path, nil
-			}
-			return "", fmt.Errorf("ffmpeg exited without producing %s", filepath.Base(path))
-		}
+	for !segmentComplete(dir, n, b) {
 		select {
 		case <-t.C:
 		case <-b.Done():
-			batchExited = true
+			return nil
 		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-		if time.Now().After(deadline) {
-			return "", ErrSegmentTimeout
+			return ctx.Err()
+		case <-timer.C:
+			return ErrSegmentTimeout
 		}
 	}
+	return nil
 }
 
 // ---------- Manager ----------

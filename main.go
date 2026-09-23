@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"io/fs"
@@ -140,12 +142,48 @@ func main() {
 func newMux(h *api.Handler, web fs.FS) *http.ServeMux {
 	mux := http.NewServeMux()
 	h.Register(mux)
-	fileServer := http.FileServer(http.FS(web))
+	fileServer := withETags(web, http.FileServer(http.FS(web)))
 	mux.HandleFunc("GET /{$}", servePage(fileServer, "/browser.html"))
 	mux.HandleFunc("GET /player", servePage(fileServer, "/player.html"))
 	mux.Handle("GET /css/", fileServer)
 	mux.Handle("GET /js/", fileServer)
 	return mux
+}
+
+// withETags gives every embedded file a content-hash ETag, computed once, and
+// asks browsers to revalidate rather than reuse blindly.
+//
+// Embedded files have no modification time, so http.FileServer sends neither
+// Last-Modified nor ETag, and without a validator a browser can only
+// re-download: every hop between the file list and the player re-fetched the
+// whole module graph and both stylesheets. With one, those hops are 304s. The
+// FileServer does the conditional-request handling itself — it reads the ETag
+// header already set on the response — so this only has to set it. no-cache
+// (not a max-age) because the files change with every rebuild of the binary.
+//
+// It must wrap the file server *inside* servePage's rewrite, since the hash is
+// looked up by the path actually being served.
+func withETags(web fs.FS, next http.Handler) http.Handler {
+	tags := map[string]string{}
+	_ = fs.WalkDir(web, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := fs.ReadFile(web, p)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		tags["/"+p] = `"` + hex.EncodeToString(sum[:8]) + `"`
+		return nil
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tag, ok := tags[r.URL.Path]; ok {
+			w.Header().Set("ETag", tag)
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // servePage serves one embedded file under whatever URL it is registered at.

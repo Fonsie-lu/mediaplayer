@@ -11,9 +11,9 @@ When launched on a terminal it opens a **TUI control panel** (Mounts / Stars / L
 - **File browser** with vim-style keybindings, per-directory cursor memory, filtering, sorting, rename, and delete.
 - **Up to 10 named mounts**, each jumpable by number key (`1`–`9`, `0`).
 - **Smart stream decision** per file via `ffprobe`:
-  - **Direct** — compatible codec/container served raw with native browser Range/seek (no ffmpeg).
-  - **Remux** — h264 video bit-identically copied into HLS segments; only incompatible audio is re-encoded.
-  - **Transcode** — full HLS transcode for anything else, or any quality cap.
+  - **Direct** — compatible codec/container served raw with native browser Range/seek (no ffmpeg). If the browser turns out not to play it after all (Safari and Matroska, say), the player switches to HLS on its own.
+  - **Remux** — h264 video bit-identically copied into HLS segments; only incompatible audio is re-encoded. Works for mpegts broadcast recordings too, whose timestamps don't start at zero.
+  - **Transcode** — full HLS transcode for anything else (including 10-bit h264, which no browser decodes), or any quality cap. Interlaced sources are deinterlaced.
 - **Full timeline from the start** — a synthetic VOD playlist enumerates every segment up front, so the whole video is seekable immediately. Segments are generated on demand in bounded batches.
 - **Audio-track selection** (per-track codec/language reported by the probe).
 - **Resume positions** stored client-side; the file list shows a progress marker for partially watched files.
@@ -112,7 +112,7 @@ All keys below work in the browser (the web client). They are vim-flavored; arro
 
 | Key          | Action                                                          |
 | ------------ | --------------------------------------------------------------- |
-| `Tab`        | Toggle the active column (file list ↔ mounts)                   |
+| `Tab`        | Toggle the active column (file list ↔ mounts)                  |
 | `1`–`9`, `0` | Jump to mount by index (`1`–`9` = mounts 1–9, `0` = 10th mount) |
 
 **File list (active column)**

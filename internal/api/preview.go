@@ -71,13 +71,24 @@ func ensureThumb(input, cachePath string, size int) error {
 	if _, err := os.Stat(cachePath); err == nil {
 		return nil
 	}
-	// Deliberately not the request's context: ffmpegthumbnailer writes straight
-	// into the cache path, so killing it on client abort would leave a truncated
-	// PNG that every later request treats as a cache hit.
-	if err := runThumbnailer(context.Background(), input, cachePath, "png", size, ""); err != nil {
+	// Generated beside the cache path and renamed into place, so the cache
+	// only ever holds whole files: the directory is stable across restarts,
+	// and a run cut short by a crash or kill used to leave a truncated PNG
+	// that every later request treated as a hit.
+	tmp, err := os.CreateTemp(filepath.Dir(cachePath), ".gen-*.png")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath) // no-op once renamed
+	// Deliberately not the request's context: other requests for the same
+	// thumbnail are queued on this generation, and a client that went away
+	// shouldn't fail theirs.
+	if err := runThumbnailer(context.Background(), input, tmpPath, "png", size, ""); err != nil {
 		return fmt.Errorf("thumbnail failed: %w", err)
 	}
-	return nil
+	return os.Rename(tmpPath, cachePath)
 }
 
 func (h *Handler) preview(w http.ResponseWriter, r *http.Request) {
