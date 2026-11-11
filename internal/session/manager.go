@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -23,6 +25,9 @@ const (
 	WindowAhead = 20  // segments ahead of current batch start to keep cached
 	IdleTimeout = 10 * time.Minute
 	reapTick    = 30 * time.Second
+	// segmentWait bounds how long one segment request may wait. The player's
+	// time-to-first-byte budget (hlsConfig in web/js/player.js) sits above it.
+	segmentWait = 30 * time.Second
 )
 
 var (
@@ -35,7 +40,7 @@ var (
 	ErrBatchStuck = errors.New("previous ffmpeg batch has not exited")
 )
 
-// Session represents one client's transcode state. With VOD-style playlists,
+// Session represents one stream open's transcode state. With VOD-style playlists,
 // the session is mostly metadata: input path, total duration, current ffmpeg
 // batch (if any), and a tmp dir of cached segments.
 type Session struct {
@@ -71,9 +76,9 @@ type Session struct {
 	closed     bool
 	lastAccess time.Time
 
-	// startMu serializes batch replacement (stop → evict → clear → spawn →
-	// install). Without it, two concurrent EnsureSegment calls that both
-	// decide "need a new batch" while mu is released around StartBatch can
+	// startMu serializes batch replacement (stop → plan → evict/clear/install
+	// → spawn). Without it, two concurrent EnsureSegment calls that both
+	// decide "need a new batch" while mu is released around the probes can
 	// end up with two live ffmpeg processes writing the same segment paths —
 	// in remux mode (in-place writes) that corrupts segments and fools the
 	// successor-exists completeness check.
@@ -141,9 +146,16 @@ func (s *Session) PlaylistText() string {
 	return b.String()
 }
 
-// EnsureSegment returns the path to seg_<n>.ts, transcoding it (and the next
-// ~BatchSize segments) on demand if not already cached. Blocks until the
-// requested file is complete, the deadline passes, or ctx is cancelled.
+// EnsureSegment returns seg_<n>.ts opened for reading, transcoding it (and the
+// next ~BatchSize segments) on demand if not already cached. Blocks until the
+// requested file is complete, the deadline passes, or ctx is cancelled. The
+// caller must close the file.
+//
+// The file is opened under s.mu, in the same critical section that judged it
+// complete. Another request's batch start can evict the name or (remux) clear
+// it and rewrite it in place at any moment after the lock is released, and an
+// open descriptor survives both; a path handed back instead left a gap in which
+// the caller could open a truncated file.
 //
 // Players don't request segments strictly in order — hls.js backtracks to
 // n-1 after seeks and may pipeline n+1 — so concurrent requests can replace
@@ -158,20 +170,20 @@ func (s *Session) PlaylistText() string {
 // (hls.js aborts in-flight segment loads on seeks and timeouts) must never
 // spawn a batch — it would stop the batch a live request is waiting on, and
 // the two would kill each other's ffmpeg until the deadline.
-func (s *Session) EnsureSegment(ctx context.Context, n int) (string, error) {
+func (s *Session) EnsureSegment(ctx context.Context, n int) (*os.File, error) {
 	if n < 0 || n >= s.NumSegments() {
-		return "", fmt.Errorf("segment %d out of range", n)
+		return nil, fmt.Errorf("segment %d out of range", n)
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(segmentWait)
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return nil, err
 		}
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
-			return "", ErrSessionClosed
+			return nil, ErrSessionClosed
 		}
 		s.lastAccess = time.Now()
 		b := s.batch
@@ -180,11 +192,13 @@ func (s *Session) EnsureSegment(ctx context.Context, n int) (string, error) {
 		// exactly what just completed n (a remux batch's last segment).
 		finished := b != nil && b.Finished()
 		if segmentComplete(s.Dir, n, b, s.retiring) {
+			// Eviction and clearing run under s.mu too, so the file judged
+			// complete is the file opened.
+			f, err := os.Open(segPath(s.Dir, n))
 			s.mu.Unlock()
-			return segPath(s.Dir, n), nil
+			return f, err
 		}
 		if b != nil && b.Contains(n) {
-			s.mu.Unlock()
 			if finished {
 				// The session's own batch covered n and had already exited
 				// (cleanup included) when n was found missing: ffmpeg gave up
@@ -193,27 +207,29 @@ func (s *Session) EnsureSegment(ctx context.Context, n int) (string, error) {
 				// try; if that one fails too, so does the request — which
 				// bounds the retries to one spawn per failing segment.
 				if b.StartSeg == n {
-					return "", fmt.Errorf("ffmpeg exited without producing %s", transcode.SegName(n))
+					s.mu.Unlock()
+					return nil, fmt.Errorf("ffmpeg exited without producing %s", transcode.SegName(n))
 				}
-				s.mu.Lock()
-				if s.batch == b {
-					s.batch = nil // no process left to stop
-				}
+				s.batch = nil // no process left to stop
 				s.mu.Unlock()
 				continue
 			}
+			s.mu.Unlock()
 			// Being produced by the active batch: wait, then re-check here.
 			if err := waitForSegment(ctx, s.Dir, n, b, time.Until(deadline)); err != nil {
-				return "", err
+				return nil, err
 			}
 			continue
 		}
 		s.mu.Unlock()
+		if time.Now().After(deadline) {
+			return nil, ErrSegmentTimeout
+		}
 
 		// No batch covers n: replace the session's batch with one that does,
 		// then loop around to the wait branch above.
 		if err := s.startBatchAt(ctx, n); err != nil && !errors.Is(err, errRetry) {
-			return "", err
+			return nil, err
 		}
 	}
 }
@@ -224,8 +240,8 @@ func (s *Session) EnsureSegment(ctx context.Context, n int) (string, error) {
 var errRetry = errors.New("retry")
 
 // startBatchAt makes a batch starting at segment n the session's current batch:
-// stop the previous one, evict cache outside the new window, spawn ffmpeg,
-// install it.
+// stop the previous one, plan the new one, evict cache outside the new window,
+// install it, spawn its ffmpeg.
 //
 // startMu makes that whole sequence atomic with respect to other spawners, so
 // the session can never have two live ffmpegs writing the same dir — in remux
@@ -292,9 +308,26 @@ func (s *Session) startBatchAt(ctx context.Context, n int) error {
 		// a batch. Nothing is orphaned by bailing out here.
 		return err
 	}
-	s.evictOutsideWindow(n)
 
 	spec := s.batchSpecFor(n)
+	started := time.Now()
+	// Plans the seek, which probes the source: slow, so outside s.mu.
+	nb, err := transcode.NewBatch(spec)
+	if err != nil {
+		return err
+	}
+
+	// Evict, clear and install under s.mu, before ffmpeg starts: from here on
+	// the completeness check sees the new batch, so no file it writes is ever
+	// judged without it. Evicting and clearing in the same critical section
+	// keeps EnsureSegment, which opens segments under s.mu, from opening a
+	// name that is about to be rewritten in place.
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrSessionClosed
+	}
+	s.evictOutsideWindow(n)
 	if s.CopyVideo {
 		// The segment muxer writes in place. Leftover files inside the new
 		// range (from a stopped earlier batch) would defeat the
@@ -304,25 +337,21 @@ func (s *Session) startBatchAt(ctx context.Context, n int) error {
 			_ = os.Remove(segPath(s.Dir, i))
 		}
 	}
-	started := time.Now()
-	nb, err := transcode.StartBatch(spec)
-	if err != nil {
+	s.batch = nb
+	s.lastAccess = time.Now()
+	s.mu.Unlock()
+
+	if err := nb.Start(); err != nil {
+		// Start closed nb's Done, so waiters already treat it as finished.
+		s.mu.Lock()
+		if s.batch == nb {
+			s.batch = nil
+		}
+		s.mu.Unlock()
 		return err
 	}
 	log.Printf("[session %s] batch seg %d..%d from %.2fs (spawned in %s)", s.ID,
 		spec.StartSeg, spec.StartSeg+spec.Count-1, spec.StartSec, time.Since(started).Round(time.Millisecond))
-
-	s.mu.Lock()
-	if s.closed {
-		// Session shut down while we were spawning; don't leak ffmpeg into a
-		// removed dir.
-		s.mu.Unlock()
-		nb.Stop()
-		return ErrSessionClosed
-	}
-	s.batch = nb
-	s.lastAccess = time.Now()
-	s.mu.Unlock()
 	return nil
 }
 
@@ -412,7 +441,8 @@ func mayBeWriting(dir string, n int, b *transcode.Batch) bool {
 }
 
 // evictOutsideWindow deletes cached .ts files outside [n-WindowBack, n+WindowAhead].
-// Bounds tmpfs RAM usage to ~1 batch's worth of segments per session.
+// Bounds tmpfs RAM usage to ~1 batch's worth of segments per session. Caller
+// holds s.mu (see startBatchAt).
 func (s *Session) evictOutsideWindow(n int) {
 	lo := n - WindowBack
 	hi := n + WindowAhead
@@ -461,9 +491,14 @@ func waitForSegment(ctx context.Context, dir string, n int, b *transcode.Batch, 
 type Manager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
+	closed   bool // CloseAll has run; Add refuses
 	stop     chan struct{}
 	wg       sync.WaitGroup
 }
+
+// ErrManagerClosed is Add's answer once CloseAll has run: an open still in
+// flight during shutdown must not register a session nothing would close.
+var ErrManagerClosed = errors.New("server shutting down")
 
 func NewManager() *Manager {
 	return &Manager{
@@ -472,16 +507,23 @@ func NewManager() *Manager {
 	}
 }
 
-// Adopt replaces the session under sid, fully cleaning up any previous one.
-func (m *Manager) Adopt(sid string, s *Session) {
+// Add registers s under a fresh random ID, which it also stores in s.ID and
+// returns. Every stream open is a session of its own: nothing else identifies
+// it — no cookie — so the unguessable ID is also the only permission to fetch
+// from or close it. (Sessions used to be keyed by one cookie per browser, and
+// two tabs replaced each other's session on every open.)
+func (m *Manager) Add(s *Session) (string, error) {
+	var buf [16]byte
+	_, _ = rand.Read(buf[:]) // never fails; see crypto/rand.Read
+	s.ID = hex.EncodeToString(buf[:])
 	s.lastAccess = time.Now()
 	m.mu.Lock()
-	prev := m.sessions[sid]
-	m.sessions[sid] = s
-	m.mu.Unlock()
-	if prev != nil {
-		prev.shutdown()
+	defer m.mu.Unlock()
+	if m.closed {
+		return "", ErrManagerClosed
 	}
+	m.sessions[s.ID] = s
+	return s.ID, nil
 }
 
 func (m *Manager) Get(sid string) (*Session, bool) {
@@ -491,14 +533,16 @@ func (m *Manager) Get(sid string) (*Session, bool) {
 	return s, ok
 }
 
-func (m *Manager) Close(sid string) {
+// Close shuts down the session under sid, reporting whether there was one.
+func (m *Manager) Close(sid string) bool {
 	m.mu.Lock()
 	s, ok := m.sessions[sid]
 	delete(m.sessions, sid)
 	m.mu.Unlock()
-	if ok && s != nil {
+	if ok {
 		s.shutdown()
 	}
+	return ok
 }
 
 func (m *Manager) CloseAll() {
@@ -507,6 +551,7 @@ func (m *Manager) CloseAll() {
 	m.mu.Lock()
 	all := m.sessions
 	m.sessions = map[string]*Session{}
+	m.closed = true
 	m.mu.Unlock()
 	for _, s := range all {
 		if s != nil {
@@ -584,11 +629,12 @@ func (s *Session) shutdown() {
 const (
 	SessTempPrefix  = "mediaplayer-sess-"  // per-session HLS segment dir
 	SheetTempPrefix = "mediaplayer-sheet-" // per-/api/sheet-request frame scratch
+	ThumbTempPrefix = "mediaplayer-thumb-" // one preview generation's scratch
 )
 
 // staleTempPrefixes is what CleanStaleTempDirs matches. The stable preview
 // cache is deliberately absent — it is meant to survive restarts.
-var staleTempPrefixes = []string{SessTempPrefix, SheetTempPrefix}
+var staleTempPrefixes = []string{SessTempPrefix, SheetTempPrefix, ThumbTempPrefix}
 
 // CleanStaleTempDirs removes leftovers matching staleTempPrefixes from previous
 // runs (e.g. after a crash or kill -9 of the server itself).

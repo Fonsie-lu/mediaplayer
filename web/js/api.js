@@ -39,9 +39,12 @@ window.api = {
   del(mount, path) {
     return this.post("/api/delete", { mount: String(mount), path });
   },
-  previewURL(mount, path, size) {
+  // version (the file's mtime) only busts the browser cache: the reply is
+  // cacheable for a day, and a file re-encoded in place keeps its URL.
+  previewURL(mount, path, size, version) {
     const q = new URLSearchParams({ mount: String(mount), path });
     if (size) q.set("size", String(size));
+    if (version) q.set("v", String(version));
     return "/api/preview?" + q;
   },
   // mount/path are optional: with them the server reports the filesystem the
@@ -69,14 +72,21 @@ window.api = {
   // with standard HLS instead of asking the server to spawn at an offset. (The
   // `t` on the /player *page* URL is unrelated and never reaches the server.)
   // signal lets the player abandon an open it has superseded; the server then
-  // skips adopting it rather than replacing the newer session.
+  // skips registering a session nobody would learn the ID of.
   openStream(mount, path, q, audio, signal) {
     const p = new URLSearchParams({ mount: String(mount), path, q: q || "" });
     if (audio != null) p.set("audio", String(audio));
     return this.json("/api/stream/open?" + p, { signal });
   },
-  closeStream() {
-    return this.json("/api/stream/close", { method: "POST" });
+  // Sent on the way out of a stream — often out of the page — so it is a
+  // beacon (falling back to a keepalive fetch) and nothing waits for it.
+  closeStream(session) {
+    if (!session) return;
+    const url = "/api/stream/close?" + new URLSearchParams({ session });
+    try {
+      if (navigator.sendBeacon && navigator.sendBeacon(url)) return;
+    } catch (_) {}
+    fetch(url, { method: "POST", keepalive: true }).catch(() => {});
   },
   stars() {
     return this.json("/api/stars");
@@ -98,10 +108,13 @@ window.fmtSize = function (n) {
   return v.toFixed(1) + " " + units[i];
 };
 
+// Local calendar date — toISOString would give the UTC one, a day off for
+// anything made near midnight.
 window.fmtDate = function (ts) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
-  return d.toISOString().slice(0, 10);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 };
 
 window.fmtTime = function (sec) {

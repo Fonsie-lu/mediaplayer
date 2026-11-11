@@ -8,10 +8,15 @@ import { state, el } from "./dom.js";
 // ---------- Disk used space ----------
 export const DISK_POLL_MS = 60000;
 
+// Bumped per refresh: after a quick mount switch, the slower of two replies
+// must not paint the other filesystem's number for a whole poll interval.
+let diskGen = 0;
+
 export async function refreshDisk() {
   // A backgrounded tab's number is read by nobody; visibilitychange below
   // refreshes it the moment the tab comes back, so it's never stale on screen.
   if (document.hidden) return;
+  const gen = ++diskGen;
   let d;
   try {
     // Report on the filesystem of the directory in view; before the mount
@@ -25,6 +30,7 @@ export async function refreshDisk() {
   } catch (_) {
     d = null;
   }
+  if (gen !== diskGen) return;
   // No disk configured, device not mounted, non-Linux build: stay hidden
   // rather than render a meaningless 0%.
   if (!d || !d.ok || !d.total_bytes) {

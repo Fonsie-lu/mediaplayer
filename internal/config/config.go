@@ -13,6 +13,16 @@ type Mount struct {
 	Path string `json:"path"`
 }
 
+// Identity is the stable key stars are stored under: the mount's name, or its
+// path when it has none. Not the index — indices renumber whenever mounts are
+// reordered or one is deleted.
+func (m Mount) Identity() string {
+	if m.Name != "" {
+		return m.Name
+	}
+	return m.Path
+}
+
 // Snapshot is the config's data: the on-disk JSON shape, and a pointer-free
 // value handlers can read without holding a lock.
 //
@@ -47,6 +57,10 @@ type Config struct {
 	mu   sync.RWMutex
 	data Snapshot
 	file string
+	// saveMu orders whole saves (marshal + write), so two concurrent Replaces
+	// can't land on disk in the opposite order to the one they took effect in.
+	// Separate from mu so readers never wait on disk I/O.
+	saveMu sync.Mutex
 }
 
 const MaxMounts = 10
@@ -87,10 +101,13 @@ func Load(path string) (*Config, error) {
 // positional keybinds) and no trailing separators, so a handler never has to
 // Clean a mount path itself. Both the config file and a live Replace go
 // through here.
+//
+// It returns a copy, so the caller's slice is never aliased by the live config.
 func normalizeMounts(mounts []Mount) []Mount {
 	if len(mounts) > MaxMounts {
 		mounts = mounts[:MaxMounts]
 	}
+	mounts = append([]Mount(nil), mounts...)
 	for i := range mounts {
 		mounts[i].Path = filepath.Clean(mounts[i].Path)
 	}
@@ -100,21 +117,51 @@ func normalizeMounts(mounts []Mount) []Mount {
 // Save writes the whole config, so any save adds keys the file may have
 // lacked (a config with no "disk" gains an empty one).
 func (c *Config) Save() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	if c.file == "" {
 		return nil // in-memory config (see New)
 	}
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	c.mu.RLock()
 	data, err := json.MarshalIndent(c.data, "", "  ")
+	c.mu.RUnlock()
 	if err != nil {
 		return err
 	}
-	if dir := filepath.Dir(c.file); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
+	return WriteFileAtomic(c.file, append(data, '\n'), 0o644)
+}
+
+// WriteFileAtomic replaces path with data so that a reader — or the next
+// start after a crash mid-write — sees either the old content or the new,
+// never a truncated file. os.WriteFile truncates first, and a config cut short
+// there fails the next start with "unexpected end of JSON input". Missing
+// parent directories are created.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
 	}
-	return os.WriteFile(c.file, append(data, '\n'), 0644)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once renamed
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Snapshot is a lock-free, pointer-free view of the config for reading.

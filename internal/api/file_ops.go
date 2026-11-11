@@ -1,8 +1,10 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -32,11 +34,33 @@ func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid destination")
 		return
 	}
+	// os.Rename silently replaces an existing destination; a rename onto a
+	// sibling's name must not destroy the sibling. (Check-then-rename, so not
+	// race-free — the same accepted limit as safeJoin's.)
+	if dst != src {
+		if _, err := os.Lstat(dst); err == nil {
+			writeErr(w, http.StatusConflict, req.NewName+" already exists")
+			return
+		}
+	}
 	if err := os.Rename(src, dst); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.relocateStars(mount.Identity(), req.Path, path.Join(path.Dir(req.Path), req.NewName))
 	writeOK(w)
+}
+
+// relocateStars moves (or, with newRel "", drops) the stars under oldRel after
+// a rename or delete. The file operation has already succeeded by then, so a
+// failure to persist is logged rather than reported as the request failing.
+func (h *Handler) relocateStars(mount, oldRel, newRel string) {
+	if h.Stars == nil {
+		return
+	}
+	if err := h.Stars.relocate(mount, path.Clean(oldRel), newRel); err != nil {
+		log.Printf("stars: could not follow %s: %v", oldRel, err)
+	}
 }
 
 type deleteReq struct {
@@ -53,8 +77,10 @@ func (h *Handler) del(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// refuse to delete the mount root itself
-	if full == filepath.Clean(mount.Path) {
+	// Refuse to delete the mount root itself. Judged on the request path, not
+	// by comparing full with mount.Path: full is absolute and a configured
+	// mount path need not be, so "", "." or "x/.." slipped past that.
+	if path.Clean("/"+filepath.ToSlash(req.Path)) == "/" || full == filepath.Clean(mount.Path) {
 		writeErr(w, http.StatusBadRequest, "refusing to delete mount root")
 		return
 	}
@@ -62,5 +88,6 @@ func (h *Handler) del(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.relocateStars(mount.Identity(), req.Path, "")
 	writeOK(w)
 }

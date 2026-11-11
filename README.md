@@ -130,7 +130,7 @@ All keys below work in the browser (the web client). They are vim-flavored; arro
 | `y`                 | Toggle star on selected entry              |
 | `p`                 | Thumbnail sheet — one frame per 10 min     |
 | `f` or `/`          | Open / close the filter                    |
-| `o`                 | Open the sort dialog                       |
+| `o`                 | Sort dialog (`j`/`k` pick, `Enter` apply)  |
 
 `p` renders one thumbnail per 10 minutes of the selected video and shows them
 all in an overlay sized to fit the window. The frames are generated on the spot
@@ -217,11 +217,13 @@ The server exposes two pages and a small JSON/HLS API:
 
 Three of those endpoints are worth calling out:
 
-- `preview` caches its thumbnails in a stable `$TMPDIR/mediaplayer-previews` dir keyed by path + mtime + size, so they survive restarts.
+- `preview` caches its thumbnails in a stable `$TMPDIR/mediaplayer-previews` dir keyed by path + mtime + thumbnail size, so they survive restarts. At most four are generated at once.
 - `sheet` is the opposite by design: it renders into a per-request temp dir, returns the frames inline as `data:` URIs, and deletes the dir before replying — nothing is kept.
 - `disk` reports the filesystem holding the `mount`/`path` it is given, falling back to the configured one when that's absent or unmeasurable. A `/dev/...` config value is resolved to its current mountpoint through `/proc/mounts` first, because `statfs` on a device node would describe `/dev` instead of the disk. Anything unusable (unset, unmounted, non-Linux) comes back as `{"ok": false}` and the header widget stays hidden.
 
-One transcode session is tracked per client cookie (`mp_sid`). Sessions stream HLS segments in bounded on-demand batches (kept in a tmpfs window around the playhead), are touched on every request as a keepalive, and are reaped after 10 minutes idle. Leftover temp dirs from crashed runs are cleaned at startup, and `SIGINT`/`SIGTERM` tears down all live sessions before exit.
+Every stream open is a session of its own, identified by a random ID carried in its playlist URL, so several tabs or devices play side by side. The player closes a session when it is done with it (`POST /api/stream/close?session=<id>`). Sessions stream HLS segments in bounded on-demand batches (kept in a tmpfs window around the playhead), are touched on every request as a keepalive, and are reaped after 10 minutes idle. Leftover temp dirs from crashed runs are cleaned at startup, and `SIGINT`/`SIGTERM`/`SIGHUP` tears down all live sessions before exit.
+
+The mutating endpoints (`rename`, `delete`, `config`, `stars/toggle`) accept only `Content-Type: application/json` bodies, which keeps other web pages from driving them cross-site. A rename never overwrites an existing entry (409), and stars follow renamed entries and disappear with deleted ones.
 
 For a detailed walkthrough of the stream decision flow, HLS batching, ffmpeg invocation, and session lifecycle, see [`CLAUDE.md`](CLAUDE.md).
 
@@ -231,7 +233,7 @@ For a detailed walkthrough of the stream decision flow, HLS batching, ffmpeg inv
 main.go                  entrypoint, embed, routing, signal handling, TUI/headless launch + restart
 internal/config/         config load/save, mounts, disk setting
 internal/api/            HTTP handlers, path safety, browse/stream/preview, sheet, stars, disk usage
-internal/session/        per-cookie session manager, segment batching, reaper
+internal/session/        session manager (one per stream open), segment batching, reaper
 internal/transcode/      ffprobe, keyframe scan, HLS batch (remux/encode)
 internal/applog/         in-memory parsed log sink (session/filename grouping) for the TUI
 internal/tui/            Bubble Tea control panel (Mounts / Stars / Logs tabs)

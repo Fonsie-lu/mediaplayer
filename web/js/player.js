@@ -22,6 +22,9 @@
   let currentAudio = 0;
   let keepalive = null;
   let playlistURL = null;
+  // The server session behind the current HLS stream. Every open is a session
+  // of its own, and the page closes the ones it is done with.
+  let sessionId = null;
   // Bumped by every play(). play() awaits the network, so a second call (a
   // quick quality change, an error fallback) can start while the first is
   // still waiting; each step checks its generation and a stale one stops
@@ -39,8 +42,12 @@
   // gets going leaves currentTime at 0, and a retry from there would throw
   // the resume position away.
   let currentStart = 0;
+  // Set by the first `playing` or `seeked` of the current play(): from then
+  // on currentTime is a real position — 0 included, a deliberate seek to the
+  // start — rather than the element's not-yet-started default.
+  let positioned = false;
   function resumePoint() {
-    return video.currentTime > 0 ? video.currentTime : currentStart;
+    return positioned ? video.currentTime : currentStart;
   }
   // The in-flight /api/stream/open, aborted when a newer play() supersedes it.
   let openAbort = null;
@@ -193,6 +200,7 @@
     currentStart = startSec;
     const gen = ++playGen;
     tearDown();
+    positioned = false;
     const resumeNote =
       startSec > 0 ? ` · ${startLabel} ${fmtTime(startSec)}` : "";
     const wantDirect =
@@ -246,7 +254,12 @@
         setStatus("open stream failed: " + e.message, true);
       return;
     }
-    if (gen !== playGen) return;
+    if (gen !== playGen) {
+      // Superseded after the server had already registered it.
+      api.closeStream(info.session);
+      return;
+    }
+    sessionId = info.session;
     attachHLS(info.playlist, startSec, gen);
     // While paused, no segment requests reach the server and the idle
     // reaper would kill the session after 10 min. Periodic playlist
@@ -339,7 +352,7 @@
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (!data.fatal || gen !== playGen) return;
         // 404 is the session, not the network: the server no longer knows
-        // this sid. hls.js doesn't retry 4xx, so this arrives at once.
+        // this session ID. hls.js doesn't retry 4xx, so this arrives at once.
         if (data.response && data.response.code === 404 && reopen()) return;
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
           mediaRecoveries++;
@@ -401,7 +414,11 @@
   // Native HLS has no FRAG_BUFFERED to refill the reopen budget on; playback
   // actually running is the same signal.
   video.addEventListener("playing", () => {
+    positioned = true;
     if (!hls) reopens = 0;
+  });
+  video.addEventListener("seeked", () => {
+    if (mode !== "none") positioned = true;
   });
 
   // Prefer an English audio track if the source has multiple. HLS output is
@@ -445,6 +462,10 @@
       } catch (_) {}
       hls = null;
     }
+    if (sessionId) {
+      api.closeStream(sessionId);
+      sessionId = null;
+    }
     mode = "none";
     // load() with no source also clears video.error and drops any error
     // event still queued for the old source, so the element-level error
@@ -453,13 +474,10 @@
     video.load();
   }
 
-  async function closeAndLeave() {
+  function closeAndLeave() {
     rememberPosition(resumePoint(), videoDuration());
     leaving = true;
-    tearDown();
-    try {
-      await api.closeStream();
-    } catch (_) {}
+    tearDown(); // closes the stream session too
     history.length > 1 ? history.back() : (location.href = "/");
   }
 
@@ -504,17 +522,22 @@
   renderMute();
 
   closeBtn.addEventListener("click", closeAndLeave);
-  // Coming back to a page closeAndLeave left (bfcache): it plays again, so
-  // its position is worth saving again.
+  // Coming back from the bfcache to a page closeAndLeave left: its teardown
+  // unloaded the video, so start again from the position it saved. Merely
+  // clearing `leaving` let the next write save the empty playhead over it.
   window.addEventListener("pageshow", (ev) => {
-    if (ev.persisted) leaving = false;
+    if (!ev.persisted || !leaving) return;
+    leaving = false;
+    if (probe) play(storedResume());
   });
   window.addEventListener("pagehide", () => {
     if (!leaving) rememberPosition(resumePoint(), videoDuration());
-    // best-effort cleanup on back nav or tab close
-    try {
-      navigator.sendBeacon("/api/stream/close");
-    } catch (_) {}
+    // Best-effort cleanup on back nav or tab close. A page restored from the
+    // bfcache then meets a 404 and reopens (see reopen).
+    if (sessionId) {
+      api.closeStream(sessionId);
+      sessionId = null;
+    }
   });
 
   // ---------- Actions ----------

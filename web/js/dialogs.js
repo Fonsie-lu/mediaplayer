@@ -9,18 +9,11 @@ import {
   currentEntry,
   applyFilter,
   refreshList,
+  focusByName,
 } from "./listing.js";
-import { refreshDisk } from "./disk.js";
 
 // ---------- Modals ----------
-export function modal({
-  title,
-  bodyHTML,
-  ok = "OK",
-  cancel = "Cancel",
-  onOk,
-  onCancel,
-}) {
+function modal({ title, bodyHTML, ok = "OK", cancel = "Cancel", onOk }) {
   el.modalTitle.textContent = title;
   el.modalBody.innerHTML = bodyHTML;
   el.modalOk.textContent = ok;
@@ -40,10 +33,7 @@ export function modal({
       status(e.message, "err");
     }
   };
-  el.modalCancel.onclick = () => {
-    onCancel && onCancel();
-    close();
-  };
+  el.modalCancel.onclick = close;
   const firstInput = el.modalBody.querySelector("input,select,button");
   if (firstInput) firstInput.focus();
 }
@@ -60,6 +50,9 @@ export function askRename() {
       if (!v) return;
       await api.rename(state.mountIdx, e.rel_path, v);
       await loadDir();
+      // Follow the entry: a rename changes its ctime and name, so under
+      // either sort it may have moved away from the cursor's old index.
+      focusByName(v);
       status("renamed", "ok");
     },
   });
@@ -82,8 +75,7 @@ export function askDelete() {
     ok: "Delete",
     onOk: async () => {
       await api.del(state.mountIdx, e.rel_path);
-      await loadDir();
-      refreshDisk();
+      await loadDir(); // refreshes the disk widget too
       status("deleted", "ok");
     },
   });
@@ -117,17 +109,32 @@ export function askSort() {
     },
   });
   document.querySelectorAll("#_sort li").forEach((li) => {
-    li.addEventListener("click", () => {
-      document
-        .querySelectorAll("#_sort li")
-        .forEach((x) => (x.dataset.selected = "false"));
-      li.dataset.selected = "true";
-    });
+    li.addEventListener("click", () => selectSortRow(li));
   });
 }
 
-export function openFilter() {
+function selectSortRow(li) {
+  document
+    .querySelectorAll("#_sort li")
+    .forEach((x) => (x.dataset.selected = "false"));
+  li.dataset.selected = "true";
+}
+
+// moveSortSelection is j/k inside the sort dialog, reporting whether one was
+// open to act on — its rows aren't focusable, so without this the keyboard
+// could only re-apply the current sort.
+export function moveSortSelection(delta) {
+  const rows = Array.from(document.querySelectorAll("#_sort li"));
+  if (el.modal.hidden || !rows.length) return false;
+  const cur = rows.findIndex((li) => li.dataset.selected === "true");
+  const next = Math.max(0, Math.min(rows.length - 1, cur + delta));
+  selectSortRow(rows[next]);
+  return true;
+}
+
+function openFilter() {
   state.focusBeforeFilter = state.focus;
+  state.filterBeforeOpen = state.filter;
   el.filter.hidden = false;
   el.filterInput.value = state.filter;
   el.filterInput.focus();
@@ -136,8 +143,9 @@ export function openFilter() {
 export function closeFilter(commit) {
   el.filter.hidden = true;
   if (!commit) {
-    // Restore the pre-filter focus so ESC feels like a true cancel.
-    state.filter = "";
+    // Restore the filter and cursor from before this edit so ESC is a true
+    // cancel: the index only means the same row under the same filter.
+    state.filter = state.filterBeforeOpen || "";
     applyFilter();
     refreshList(state.focusBeforeFilter || 0);
   }

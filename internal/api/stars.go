@@ -3,11 +3,12 @@ package api
 import (
 	"encoding/json"
 	"log"
+	"maps"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"mediaplayer/internal/config"
@@ -92,16 +93,6 @@ func NewStarStore(path string, cfg *config.Config) (*StarStore, error) {
 	return s, nil
 }
 
-// mountIdentity is the stable key for a mount: its name, or its path when the
-// name is empty. Two unnamed mounts would otherwise share the identity "" and
-// collapse each other's stars.
-func mountIdentity(m config.Mount) string {
-	if m.Name != "" {
-		return m.Name
-	}
-	return m.Path
-}
-
 // migrateMount converts a legacy numeric mount field to the mount's name,
 // reporting whether it did. A number that names no current mount is left alone:
 // the star is already orphaned and guessing would attach it to the wrong
@@ -115,7 +106,7 @@ func (s *StarStore) migrateMount(mount string) (string, bool) {
 	if !ok {
 		return mount, false
 	}
-	id := mountIdentity(m)
+	id := m.Identity()
 	if id == "" {
 		return mount, false
 	}
@@ -126,7 +117,7 @@ func (s *StarStore) migrateMount(mount string) (string, bool) {
 // no configured mount carries that name.
 func (s *StarStore) indexOf(name string) string {
 	for i, m := range s.cfg.Snapshot().Mounts {
-		if mountIdentity(m) == name {
+		if m.Identity() == name {
 			return strconv.Itoa(i)
 		}
 	}
@@ -154,16 +145,11 @@ func (s *StarStore) save() error {
 	if err != nil {
 		return err
 	}
-	// Create the config dir if it isn't there yet — same as config.Save. Without
-	// this, every toggle 500s on a machine whose ~/.config (or XDG_CONFIG_HOME)
-	// doesn't exist: reading a missing star file is a supported empty start, so
-	// nothing else would have created the directory first.
-	if dir := filepath.Dir(s.path); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	return os.WriteFile(s.path, data, 0o644)
+	// Creates the config dir if it isn't there yet. Without that, every toggle
+	// 500'd on a machine whose ~/.config (or XDG_CONFIG_HOME) didn't exist:
+	// reading a missing star file is a supported empty start, so nothing else
+	// would have created the directory first.
+	return config.WriteFileAtomic(s.path, data, 0o644)
 }
 
 // toggle flips the star for ref and persists. Returns the new starred state.
@@ -215,6 +201,40 @@ func (s *StarStore) Remove(ref StarRef) error {
 	return nil
 }
 
+// relocate rewrites the stars on mount at or below oldRel to sit at or below
+// newRel instead — or drops them when newRel is "" — and persists. rename and
+// delete call it, so a star follows its entry rather than pointing at a path
+// that no longer exists (invisible on the page, removable only from the TUI).
+func (s *StarStore) relocate(mount, oldRel, newRel string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := maps.Clone(s.set)
+	changed := false
+	for k, ref := range s.set {
+		if ref.Mount != mount {
+			continue
+		}
+		rest, ok := strings.CutPrefix(ref.Path, oldRel)
+		if !ok || (rest != "" && !strings.HasPrefix(rest, "/")) {
+			continue
+		}
+		delete(s.set, k)
+		changed = true
+		if newRel != "" {
+			ref.Path = newRel + rest
+			s.set[ref.key()] = ref
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.save(); err != nil {
+		s.set = before // roll back so memory matches disk
+		return err
+	}
+	return nil
+}
+
 func (h *Handler) getStars(w http.ResponseWriter, r *http.Request) {
 	refs := h.Stars.List()
 	out := make([]starWire, 0, len(refs))
@@ -243,7 +263,7 @@ func (h *Handler) toggleStar(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	ref.Mount = mountIdentity(mount)
+	ref.Mount = mount.Identity()
 	starred, err := h.Stars.toggle(ref)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

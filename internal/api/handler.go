@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"log"
+	"mime"
 	"net/http"
 
 	"mediaplayer/internal/config"
@@ -63,10 +64,27 @@ func writeOK(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// maxBodyBytes bounds a mutating request's JSON body; the largest real one is
+// a config of ten mounts.
+const maxBodyBytes = 1 << 20
+
 // decodeBody decodes the JSON request body into v, writing the error response
 // itself. Callers must return immediately when ok is false. The method is the
 // mux's business (see Register), so this only handles the body.
+//
+// The Content-Type check is the server's whole defence against cross-site
+// requests. Any web page the user visits can make their browser POST to this
+// LAN address, but only as a "simple" request — text/plain, a form encoding —
+// unless the target answers a CORS preflight, which this server never does.
+// Decoding JSON out of whatever type arrived let such a page delete or rename
+// files and re-point mounts; requiring application/json forces the preflight,
+// and the preflight fails.
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) (ok bool) {
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return false

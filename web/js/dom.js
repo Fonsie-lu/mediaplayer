@@ -9,18 +9,31 @@
 // Part of the file-browser page. api.js is loaded as a classic script before
 // these modules, so window.api / fmtSize / fmtDate / fmtTime are globals here.
 
-// Web storage throws in private-mode Safari, when the quota is full, and on a
-// corrupt value; nothing the page keeps there is worth failing an interaction
-// over, let alone throwing during module evaluation. Every read and write of
-// mp.* goes through these two.
-export function store(key, value, storage = localStorage) {
+// Web storage throws in private-mode Safari, when the quota is full, on a
+// corrupt value, and — with site data blocked — on merely touching the
+// `localStorage` global; nothing the page keeps there is worth failing an
+// interaction over, let alone throwing during module evaluation. Every read
+// and write of mp.* goes through these three. `session` picks sessionStorage
+// over localStorage; the storage object is looked up inside the try, since
+// that lookup is what throws when site data is blocked.
+function backing(session) {
+  return session ? window.sessionStorage : window.localStorage;
+}
+export function store(key, value, session = false) {
   try {
-    storage.setItem(key, value);
+    backing(session).setItem(key, value);
   } catch (_) {}
 }
-export function loadJSON(key, storage = localStorage) {
+export function load(key, session = false) {
   try {
-    return JSON.parse(storage.getItem(key) || "{}");
+    return backing(session).getItem(key);
+  } catch (_) {
+    return null;
+  }
+}
+export function loadJSON(key, session = false) {
+  try {
+    return JSON.parse(load(key, session) || "{}") || {};
   } catch (_) {
     return {};
   }
@@ -33,7 +46,7 @@ export const state = {
   entries: [],
   filtered: [],
   focus: 0,
-  sort: localStorage.getItem("mp.sort") || "ctime_desc",
+  sort: load("mp.sort") || "ctime_desc",
   filter: "",
   stars: new Set(), // keys: `${mountIdx}:${rel_path}`
   // cursorMemory[`${mountIdx}:${path}`] = focus index
@@ -44,7 +57,9 @@ export const state = {
   sheetBusy: false, // a /api/sheet render is in flight
   gState: 0, // for "gg" double-press
   activeCol: "files", // "files" | "mounts" — which column Tab is on
-  focusBeforeFilter: 0, // restore this on filter ESC
+  focusBeforeFilter: 0, // restore this on filter ESC…
+  filterBeforeOpen: "", // …together with the filter it indexed into
+  sheetAbort: null, // AbortController of the in-flight /api/sheet render
 };
 
 export const el = {
@@ -100,13 +115,13 @@ export function setActiveCol(col) {
   target.focus({ preventScroll: true });
 }
 
-export const NERD_ICONS = {
+const NERD_ICONS = {
   folder: "󰉋",
   video: "",
   other: "󱀶",
   disk: "\u{f0a0}",
 }; // disk = nf-fa-hdd_o
-export const FALLBACK_ICONS = {
+const FALLBACK_ICONS = {
   folder: "📁",
   video: "🎬",
   other: "📄",

@@ -7,7 +7,7 @@
 // Part of the file-browser page. api.js is loaded as a classic script before
 // these modules, so window.api / fmtSize / fmtDate / fmtTime are globals here.
 
-import { state, el, ICONS, setActiveCol, store } from "./dom.js";
+import { state, el, ICONS, setActiveCol, store, load } from "./dom.js";
 import {
   loadStars,
   loadMounts,
@@ -38,6 +38,7 @@ import {
   applySort,
   toggleFilter,
   closeFilter,
+  moveSortSelection,
 } from "./dialogs.js";
 
 // ---------- Keybinds ----------
@@ -93,6 +94,11 @@ document.addEventListener("keydown", (ev) => {
     return;
   }
   if (!el.modal.hidden) {
+    const sortStep = { j: 1, ArrowDown: 1, k: -1, ArrowUp: -1 }[ev.key];
+    if (sortStep && moveSortSelection(sortStep)) {
+      ev.preventDefault();
+      return;
+    }
     if (ev.key === "Escape") el.modalCancel.click();
     else if (ev.key === "Enter" && ev.target.tagName !== "BUTTON")
       el.modalOk.click();
@@ -266,6 +272,10 @@ const rowIndex = (ev) => {
   return li ? Number(li.dataset.i) : -1;
 };
 el.fileList.addEventListener("click", (ev) => {
+  // The second click of a double click: the first one already acted, and on
+  // a folder it has opened it, so this one would land on whatever row of the
+  // new listing sits under the pointer.
+  if (ev.detail > 1) return;
   const i = rowIndex(ev);
   if (i < 0) return;
   setFocus(i);
@@ -274,10 +284,11 @@ el.fileList.addEventListener("click", (ev) => {
   // so the cursor can be parked on it without leaving the page.
   if (currentEntry()?.is_dir) enterFocused();
 });
-// The click above has already moved the cursor here (a dblclick is always
-// preceded by clicks), so this only has to open what the cursor is on.
+// The first click has already moved the cursor here, so this only has to open
+// what the cursor is on — a file: a folder was opened by that click already.
 el.fileList.addEventListener("dblclick", (ev) => {
-  if (rowIndex(ev) >= 0) enterFocused();
+  if (rowIndex(ev) >= 0 && currentEntry() && !currentEntry().is_dir)
+    enterFocused();
 });
 el.mountList.addEventListener("click", (ev) => {
   const i = rowIndex(ev);
@@ -310,9 +321,9 @@ const MOBILE_NAV_KEY = "mp.mobilenav.open";
 function setMobileNavOpen(open) {
   el.mobileNav.hidden = !open;
   el.mobileNavToggle.setAttribute("aria-expanded", open ? "true" : "false");
-  store(MOBILE_NAV_KEY, open ? "1" : "0", sessionStorage);
+  store(MOBILE_NAV_KEY, open ? "1" : "0", true);
 }
-setMobileNavOpen(sessionStorage.getItem(MOBILE_NAV_KEY) === "1");
+setMobileNavOpen(load(MOBILE_NAV_KEY, true) === "1");
 el.mobileNavToggle.addEventListener("click", () => {
   setMobileNavOpen(el.mobileNav.hidden);
 });

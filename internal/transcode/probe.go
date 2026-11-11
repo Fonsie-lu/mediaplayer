@@ -56,6 +56,7 @@ type ffprobeOut struct {
 		Height     int    `json:"height"`
 		PixFmt     string `json:"pix_fmt"`
 		FieldOrder string `json:"field_order"`
+		Duration   string `json:"duration"`
 		Tags       struct {
 			Language string `json:"language"`
 			Title    string `json:"title"`
@@ -142,8 +143,17 @@ func parseProbe(out []byte) (*ProbeResult, error) {
 		return nil, err
 	}
 	r := &ProbeResult{Container: p.Format.FormatName}
-	if d, err := strconv.ParseFloat(p.Format.Duration, 64); err == nil {
+	if d, err := strconv.ParseFloat(p.Format.Duration, 64); err == nil && d > 0 {
 		r.Duration = d
+	} else {
+		// No container duration ("N/A" for raw elementary streams and some
+		// growing recordings): the longest stream's will do, where the
+		// alternative is a file that can't be streamed at all.
+		for _, st := range p.Streams {
+			if d, err := strconv.ParseFloat(st.Duration, 64); err == nil && d > r.Duration {
+				r.Duration = d
+			}
+		}
 	}
 	if st, err := strconv.ParseFloat(p.Format.StartTime, 64); err == nil {
 		r.StartTime = st
@@ -184,8 +194,38 @@ func parseProbe(out []byte) (*ProbeResult, error) {
 			break
 		}
 	}
-	r.Direct = containerOK && r.BrowserDecodableVideo() && (r.ACodec == "" || directACodecs[r.ACodec])
+	r.Direct = containerOK && r.BrowserDecodableVideo() && r.directAudioOK()
 	return r, nil
+}
+
+// browserAudio is the track a browser plays from the raw file: the
+// default-flagged one, else the first. (HTMLMediaElement.audioTracks could
+// switch it, but only Safari implements that.)
+func browserAudio(tracks []AudioTrack) int {
+	for _, t := range tracks {
+		if t.Default {
+			return t.Index
+		}
+	}
+	return 0
+}
+
+// directAudioOK reports whether serving the raw file plays acceptable audio:
+// the track the browser picks must be decodable and, when the video could be
+// remuxed cheaply instead, be the preferred one — otherwise an mkv whose
+// default track is German plays German while the player shows English
+// selected. For other video codecs a mismatch is tolerated: the only way to
+// switch tracks there is a full re-encode, and the player still tries
+// audioTracks and offers the selector.
+func (r *ProbeResult) directAudioOK() bool {
+	if len(r.AudioTracks) == 0 {
+		return true
+	}
+	played := browserAudio(r.AudioTracks)
+	if !directACodecs[r.AudioTracks[played].Codec] {
+		return false
+	}
+	return played == r.PreferredAudio || r.VCodec != "h264"
 }
 
 // englishTags covers the common ISO 639 spellings that show up in mkv/mp4 tags.

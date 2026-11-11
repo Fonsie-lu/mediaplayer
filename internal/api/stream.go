@@ -1,8 +1,6 @@
 package api
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
@@ -14,25 +12,6 @@ import (
 	"mediaplayer/internal/session"
 	"mediaplayer/internal/transcode"
 )
-
-const sessionCookie = "mp_sid"
-
-func (h *Handler) sid(w http.ResponseWriter, r *http.Request) string {
-	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
-		return c.Value
-	}
-	var buf [16]byte
-	_, _ = rand.Read(buf[:])
-	id := hex.EncodeToString(buf[:])
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    id,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-	return id
-}
 
 func (h *Handler) probe(w http.ResponseWriter, r *http.Request) {
 	_, full, ok := h.queryTarget(w, r)
@@ -56,9 +35,9 @@ func (h *Handler) streamDirect(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// On open, wipe any prior transcode session for this client.
-	sid := h.sid(w, r)
-	h.Sessions.Close(sid)
+	// No session involved: the browser fetches the file itself. (This used to
+	// close "the client's" HLS session, which with one cookie per browser was
+	// any other tab's.)
 	switch strings.ToLower(filepath.Ext(full)) {
 	case ".mkv":
 		w.Header().Set("Content-Type", "video/x-matroska")
@@ -164,21 +143,19 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 		return transcode.KeyframeTimes(full, probe.StartTime)
 	})
 
-	// Sessions are keyed by cookie and adopted in the order opens *finish*, and
-	// a keyframe scan can take minutes. An open whose client has already moved
-	// on (a quality switch, another video) must not land after the newer one
-	// and replace the session that page is playing.
+	// A keyframe scan can take minutes. Nobody would ever learn the ID of a
+	// session registered for an open the client has already abandoned (a
+	// quality switch, another video), so it would only hold a dir until the
+	// reaper found it.
 	if r.Context().Err() != nil {
 		return
 	}
-	sid := h.sid(w, r)
 	dir, err := os.MkdirTemp("", session.SessTempPrefix)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	sess := &session.Session{
-		ID:          sid,
 		Input:       full,
 		Duration:    probe.Duration,
 		MaxHeight:   plan.MaxHeight,
@@ -190,7 +167,12 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 		CopyAudio:   plan.CopyAudio,
 		Boundaries:  plan.Boundaries,
 	}
-	h.Sessions.Adopt(sid, sess)
+	sid, err := h.Sessions.Add(sess)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	log.Printf("[session %s] opened path=%s dur=%.1fs q=%s audio=%d mode=%s acopy=%t deint=%t origin=%.3f segs=%d dir=%s",
 		sid, rel, probe.Duration, q, plan.AudioIdx, plan.mode(), plan.CopyAudio, sess.Deinterlace && !plan.CopyVideo,
 		probe.StartTime, sess.NumSegments(), dir)
@@ -202,10 +184,18 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// streamClose ends the session named by ?session=. The player sends it as a
+// beacon on its way out of a stream, so the reply is never read; an unknown
+// ID — already reaped, or closed twice — is not an error.
 func (h *Handler) streamClose(w http.ResponseWriter, r *http.Request) {
-	sid := h.sid(w, r)
-	h.Sessions.Close(sid)
-	log.Printf("[session %s] closed", sid)
+	sid := r.URL.Query().Get("session")
+	if sid == "" {
+		writeErr(w, http.StatusBadRequest, "missing session")
+		return
+	}
+	if h.Sessions.Close(sid) {
+		log.Printf("[session %s] closed", sid)
+	}
 	writeOK(w)
 }
 
@@ -238,41 +228,36 @@ func (h *Handler) streamHLS(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad segment name")
 		return
 	}
-	path, err := sess.EnsureSegment(r.Context(), n)
+	f, err := sess.EnsureSegment(r.Context(), n)
 	if err != nil {
-		if r.Context().Err() != nil {
+		switch {
+		case r.Context().Err() != nil:
 			// Client aborted the request (hls.js cancels segment loads on
 			// seeks); nobody is listening for a response.
-			return
-		}
-		if errors.Is(err, session.ErrSegmentTimeout) {
+		case errors.Is(err, session.ErrSessionClosed):
+			// Closed while this request waited: the same answer as a session
+			// that was never there, which the player meets by reopening at
+			// once (a 5xx would first sit through hls.js's retry backoff).
+			writeErr(w, http.StatusNotFound, "no session")
+		case errors.Is(err, session.ErrSegmentTimeout):
 			writeErr(w, http.StatusGatewayTimeout, err.Error())
-		} else {
+		default:
 			writeErr(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
-	// Opened here rather than by path inside ServeFile: another request's batch
-	// start can evict or clear this segment at any moment (hls.js backtracking
-	// to n-1 clears n.. in remux mode). An open file survives its deletion; a
-	// file already gone is a 503, which hls.js retries — a 404 would read as
-	// "session lost" to the player and reopen the whole stream.
-	f, err := os.Open(path)
-	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "segment was replaced, retry")
-		return
-	}
+	// Served from the handle EnsureSegment opened under the session lock:
+	// another request's batch start can evict or clear the name at any moment
+	// after that, and an open file survives it.
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "video/mp2t")
-	// The URL is per cookie, not per video or per session instance: the same
-	// seg_00042.ts names a different file after a quality or audio switch, or
-	// on the next video. A cached copy — a Last-Modified invites heuristic
-	// caching — would splice the old one in.
+	// Scratch files gone from the server within minutes: a film's worth would
+	// only fill the browser's disk cache.
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeContent(w, r, file, st.ModTime(), f)
 }

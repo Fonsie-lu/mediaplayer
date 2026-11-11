@@ -12,7 +12,7 @@ test:
 	go test -v ./...
 
 # The session/batch code is concurrent enough that the race detector earns its
-# runtime; CI runs this rather than plain `test`.
+# runtime; `check` runs this rather than plain `test`.
 race:
 	go test -race ./...
 
@@ -27,7 +27,7 @@ lint:
 fmt:
 	gofmt -w .
 
-# Same check CI makes: report files gofmt would change, and fail if any.
+# Report files gofmt would change, and fail if any.
 fmt-check:
 	@out="$$(gofmt -l . | grep -v '^\.claude/' || true)"; \
 	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
@@ -39,10 +39,10 @@ fmt-check:
 # NOT part of `check`, which must run anywhere. Override CHROME= if yours lives
 # elsewhere.
 e2e: build
-	@cd test/e2e && [ -d node_modules ] || npm install --no-audit --no-fund
+	@[ -d test/e2e/node_modules ] || (cd test/e2e && npm install --no-audit --no-fund)
 	node test/e2e/harness.mjs
 
-# Everything the CI gate runs, in the order that fails fastest.
+# The gate to pass before calling Go work done, in the order that fails fastest.
 check: fmt-check vet lint race
 
 clean:

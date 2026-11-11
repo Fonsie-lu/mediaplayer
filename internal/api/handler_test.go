@@ -67,10 +67,10 @@ func TestStreamHLSRouting(t *testing.T) {
 		t.Errorf("unknown session: status %d, want 404", got)
 	}
 
-	mgr.Adopt("sid1", &session.Session{ID: "sid1", Duration: 8, Dir: t.TempDir()})
+	sid, _ := mgr.Add(&session.Session{Duration: 8, Dir: t.TempDir()})
 
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/stream/hls/sid1/playlist.m3u8", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/stream/hls/"+sid+"/playlist.m3u8", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("playlist: status %d, want 200", rec.Code)
 	}
@@ -78,13 +78,60 @@ func TestStreamHLSRouting(t *testing.T) {
 		t.Errorf("playlist body has no segment line:\n%s", body)
 	}
 
-	if got := status(t, mux, "GET", "/api/stream/hls/sid1/notasegment.ts"); got != http.StatusBadRequest {
+	if got := status(t, mux, "GET", "/api/stream/hls/"+sid+"/notasegment.ts"); got != http.StatusBadRequest {
 		t.Errorf("bad segment name: status %d, want 400", got)
 	}
 
 	// A path that tries to climb out is resolved by the mux before matching,
 	// so it never reaches the handler as a {file} value.
-	if got := status(t, mux, "GET", "/api/stream/hls/sid1/../../etc/passwd"); got == http.StatusOK {
+	if got := status(t, mux, "GET", "/api/stream/hls/"+sid+"/../../etc/passwd"); got == http.StatusOK {
 		t.Error("traversal attempt returned 200")
+	}
+}
+
+// Every open is a session of its own, closed by its ID: closing one must leave
+// another page's session playing (they used to share one cookie-keyed slot).
+func TestStreamCloseBySessionID(t *testing.T) {
+	mux, mgr := testMux(t)
+	a, _ := mgr.Add(&session.Session{Duration: 8, Dir: t.TempDir()})
+	b, _ := mgr.Add(&session.Session{Duration: 8, Dir: t.TempDir()})
+	if a == b {
+		t.Fatalf("two sessions share ID %q", a)
+	}
+
+	if got := status(t, mux, "POST", "/api/stream/close"); got != http.StatusBadRequest {
+		t.Errorf("close without session: status %d, want 400", got)
+	}
+	if got := status(t, mux, "POST", "/api/stream/close?session="+a); got != http.StatusOK {
+		t.Errorf("close: status %d, want 200", got)
+	}
+	if got := status(t, mux, "POST", "/api/stream/close?session="+a); got != http.StatusOK {
+		t.Errorf("second close: status %d, want 200", got)
+	}
+	if got := status(t, mux, "GET", "/api/stream/hls/"+a+"/playlist.m3u8"); got != http.StatusNotFound {
+		t.Errorf("closed session: status %d, want 404", got)
+	}
+	if got := status(t, mux, "GET", "/api/stream/hls/"+b+"/playlist.m3u8"); got != http.StatusOK {
+		t.Errorf("other session after close: status %d, want 200", got)
+	}
+}
+
+// A cross-site page can only send "simple" requests without a preflight this
+// server never answers — so a mutating endpoint must refuse any body that
+// isn't declared JSON, or that page could delete files.
+func TestMutatingEndpointsRequireJSON(t *testing.T) {
+	mux, _ := testMux(t)
+	for _, target := range []string{"/api/rename", "/api/delete", "/api/stars/toggle", "/api/config"} {
+		for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded"} {
+			req := httptest.NewRequest("POST", target, strings.NewReader(`{"mount":"0","path":"x"}`))
+			if ct != "" {
+				req.Header.Set("Content-Type", ct)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnsupportedMediaType {
+				t.Errorf("POST %s as %q: status %d, want 415", target, ct, rec.Code)
+			}
+		}
 	}
 }

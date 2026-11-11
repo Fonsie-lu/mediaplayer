@@ -81,7 +81,7 @@ func (m Model) updateLogs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "ctrl+d":
-		m.lSel = min(n-1, m.lSel+m.contentHeight()/2)
+		m.lSel = max(0, min(n-1, m.lSel+m.contentHeight()/2))
 	case "ctrl+u":
 		m.lSel = max(0, m.lSel-m.contentHeight()/2)
 	case "l", "right":

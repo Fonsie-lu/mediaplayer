@@ -29,9 +29,9 @@ address.
 - **Keep-awake while playing** — the page never asks Android for a wakelock, so
   a small script injected on each page load reports `play`/`pause`/`ended`
   through a `MPHost` bridge and the window's KEEP_SCREEN_ON flag follows.
-- **DOM storage and cookies** — per-directory cursor memory, sort preference
-  and resume positions live in `localStorage`, and the `mp_sid` session cookie
-  is what ties a browser to its transcode session. Both are enabled explicitly.
+- **DOM storage** — per-directory cursor memory, sort preference and resume
+  positions live in `localStorage` (enabled explicitly). Stream sessions are
+  identified by an ID the page holds in memory, so no cookie is involved.
 - **Autoplay** — `setMediaPlaybackRequiresUserGesture(false)`, or HLS playback
   stalls waiting for a gesture that already happened.
 - **Links out** stay out: anything not on the configured origin is handed to

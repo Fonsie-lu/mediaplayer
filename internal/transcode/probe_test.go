@@ -92,3 +92,50 @@ func TestParseProbeStartTimeAndInterlace(t *testing.T) {
 		}
 	}
 }
+
+// The browser plays a raw file's default (or first) track, so direct play must
+// judge that track — not merely the first — and, for remuxable h264, step
+// aside when the preferred track is a different one.
+func TestParseProbeDirectAudioTrack(t *testing.T) {
+	doc := func(vcodec, a0, a1 string, a0Default bool) []byte {
+		def := "0"
+		if a0Default {
+			def = "1"
+		}
+		return []byte(`{"format":{"format_name":"matroska,webm","duration":"60"},
+			"streams":[
+			{"codec_type":"video","codec_name":"` + vcodec + `","pix_fmt":"yuv420p"},
+			{"codec_type":"audio","codec_name":"` + a0 + `","tags":{"language":"ger"},"disposition":{"default":` + def + `}},
+			{"codec_type":"audio","codec_name":"` + a1 + `","tags":{"language":"eng"}}]}`)
+	}
+	cases := []struct {
+		name string
+		doc  []byte
+		want bool
+	}{
+		{"h264, browser plays German, English preferred", doc("h264", "aac", "aac", true), false},
+		{"vp9, same mismatch: tolerated over a re-encode", doc("vp9", "opus", "opus", true), true},
+		{"browser track undecodable", doc("vp9", "ac3", "opus", true), false},
+	}
+	for _, c := range cases {
+		r, err := parseProbe(c.doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Direct != c.want {
+			t.Errorf("%s: Direct = %t, want %t", c.name, r.Direct, c.want)
+		}
+	}
+}
+
+func TestParseProbeDurationFallsBackToStreams(t *testing.T) {
+	r, err := parseProbe([]byte(`{"format":{"format_name":"h264","duration":"N/A"},
+		"streams":[{"codec_type":"video","codec_name":"h264","duration":"42.5"},
+		{"codec_type":"audio","codec_name":"aac","duration":"42.0"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Duration != 42.5 {
+		t.Errorf("Duration = %v, want 42.5 from the longest stream", r.Duration)
+	}
+}

@@ -111,7 +111,7 @@ type BatchSpec struct {
 	SplitTimes []float64
 }
 
-// batchPlan is everything StartBatch decides before it can build an ffmpeg
+// batchPlan is everything NewBatch decides before it can build an ffmpeg
 // command line: where to seek, where the content that seek reaches actually
 // begins, and how much of it must be trimmed back off.
 //
@@ -409,63 +409,69 @@ func batchArgs(spec BatchSpec, plan batchPlan) []string {
 	return args
 }
 
-// StartBatch spawns ffmpeg to produce segments seg_<StartSeg>..seg_<StartSeg+Count-1>
-// in spec.Dir. Each segment's PTS is offset by StartSec so that segments
-// produced by different batches share a single global timeline (no
-// EXT-X-DISCONTINUITY needed at batch boundaries).
-//
-// `-ss` is given as an input option with default accurate-seek, so the first
-// frame produced corresponds exactly to source second StartSec. In remux
-// mode StartSec is itself a keyframe timestamp, so the copied stream starts
-// exactly there.
+// NewBatch prepares the ffmpeg run that produces segments
+// seg_<StartSeg>..seg_<StartSeg+Count-1> in spec.Dir, without starting it.
+// Each segment's PTS is offset so that segments produced by different batches
+// share a single global timeline (no EXT-X-DISCONTINUITY needed at batch
+// boundaries).
 //
 // In encode mode `-force_key_frames` ensures every segment begins with an
 // IDR frame, which HLS requires for independent decoding. In copy mode the
 // muxer splits at the source's own keyframes — the same boundaries the
 // session's playlist was built from.
 //
-// The work is three steps: planBatch probes where the seek lands, batchArgs
-// turns spec+plan into a command line (pure, so it is the tested part), and
-// this function spawns it and watches the process.
-func StartBatch(spec BatchSpec) (*Batch, error) {
+// Preparing and starting are separate so the session can install the batch —
+// where its completeness check sees it — before any of its files can exist:
+// a remux batch writes in place, and a file it is still writing must never be
+// judged by a check that doesn't know the batch is there. The work is three
+// steps: planBatch probes where the seek lands (slow, so it happens here,
+// outside any session lock), batchArgs turns spec+plan into a command line
+// (pure, so it is the tested part), and Start spawns it and watches the
+// process.
+func NewBatch(spec BatchSpec) (*Batch, error) {
 	if err := os.MkdirAll(spec.Dir, 0o755); err != nil {
 		return nil, err
 	}
-	args := batchArgs(spec, planBatch(spec))
-
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.Command("ffmpeg", batchArgs(spec, planBatch(spec))...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	logPath := filepath.Join(spec.Dir, fmt.Sprintf("ffmpeg-%05d.log", spec.StartSeg))
-	if logFile, err := os.Create(logPath); err == nil {
-		cmd.Stderr = logFile
-		cmd.Stdout = logFile
-		defer logFile.Close() // the child holds its own descriptor
-	}
-	b := &Batch{
+	return &Batch{
 		Dir:        spec.Dir,
 		StartSeg:   spec.StartSeg,
 		Count:      spec.Count,
 		Cmd:        cmd,
 		Sequential: spec.CopyVideo,
-		started:    time.Now(),
 		done:       make(chan struct{}),
+	}, nil
+}
+
+// Start spawns the prepared ffmpeg. On error the batch counts as finished
+// (Done is closed), so nothing waits on a process that never ran.
+func (b *Batch) Start() error {
+	first, last := b.StartSeg, b.StartSeg+b.Count-1
+	logPath := filepath.Join(b.Dir, fmt.Sprintf("ffmpeg-%05d.log", first))
+	if logFile, err := os.Create(logPath); err == nil {
+		b.Cmd.Stderr = logFile
+		b.Cmd.Stdout = logFile
+		defer logFile.Close() // the child holds its own descriptor
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
+	b.started = time.Now()
+	if err := b.Cmd.Start(); err != nil {
+		b.once.Do(func() {}) // Stop has no process to signal
+		close(b.done)
+		return err
 	}
 	go func() {
-		werr := cmd.Wait()
+		werr := b.Cmd.Wait()
 		if werr != nil {
 			var exit *exec.ExitError
 			switch {
 			case !errors.As(werr, &exit):
-				log.Printf("ffmpeg batch [%d..%d] wait: %v", spec.StartSeg, spec.StartSeg+spec.Count-1, werr)
+				log.Printf("ffmpeg batch [%d..%d] wait: %v", first, last, werr)
 			case !b.stopping.Load():
 				// Not our signal, so ffmpeg itself gave up. Its log is in a
 				// session dir that is about to be deleted; its last line is
 				// what explains the failure.
-				log.Printf("ffmpeg batch [%d..%d] failed (%v): %s", spec.StartSeg, spec.StartSeg+spec.Count-1,
-					werr, lastLine(logPath))
+				log.Printf("ffmpeg batch [%d..%d] failed (%v): %s", first, last, werr, lastLine(logPath))
 			}
 			// Whatever ended it, the segment it was writing may be cut short
 			// under its final name — drop it before waiters re-check.
@@ -473,7 +479,7 @@ func StartBatch(spec BatchSpec) (*Batch, error) {
 		}
 		close(b.done)
 	}()
-	return b, nil
+	return nil
 }
 
 // lastLine returns the last non-empty line of the file at path, or "" when it

@@ -23,12 +23,12 @@ const procMounts = "/proc/mounts"
 type diskInfo struct {
 	OK         bool   `json:"ok"`
 	Mountpoint string `json:"mountpoint,omitempty"`
-	TotalBytes uint64 `json:"total_bytes,omitempty"`
-	AvailBytes uint64 `json:"avail_bytes,omitempty"`
+	TotalBytes uint64 `json:"total_bytes"`
+	AvailBytes uint64 `json:"avail_bytes"`
 	// UsedBytes is total minus *unprivileged-available*, so root-reserved
 	// blocks count as used — the widget reports what a normal user can't have.
-	UsedBytes   uint64  `json:"used_bytes,omitempty"`
-	PercentUsed float64 `json:"percent_used,omitempty"`
+	UsedBytes   uint64  `json:"used_bytes"`
+	PercentUsed float64 `json:"percent_used"`
 }
 
 func (h *Handler) disk(w http.ResponseWriter, r *http.Request) {

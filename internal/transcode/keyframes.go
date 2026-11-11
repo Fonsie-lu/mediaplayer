@@ -73,16 +73,23 @@ func scanKeyframeFile(path string) ([]float64, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("keyframe scan: %w", err)
 	}
-	times := scanKeyframes(stdout)
+	times, scanErr := scanKeyframes(stdout)
+	// Drain whatever the scan stopped short of: ffprobe blocks on a full pipe,
+	// and Wait would then sit out the whole timeout.
+	_, _ = io.Copy(io.Discard, stdout)
 	if err := cmd.Wait(); err != nil {
 		return nil, fmt.Errorf("keyframe scan: %w", err)
+	}
+	if scanErr != nil {
+		// A partial list would put boundaries where there are none.
+		return nil, fmt.Errorf("keyframe scan: %w", scanErr)
 	}
 	return times, nil
 }
 
 // scanKeyframes extracts keyframe PTS from a stream of `pts_time,flags` CSV
 // lines, e.g. "12.345000,K__". Packets without a PTS ("N/A") are skipped.
-func scanKeyframes(r io.Reader) []float64 {
+func scanKeyframes(r io.Reader) ([]float64, error) {
 	var times []float64
 	sc := bufio.NewScanner(r)
 	// A CSV line is short, but a corrupt stream shouldn't kill the scan with
@@ -101,13 +108,14 @@ func scanKeyframes(r io.Reader) []float64 {
 		times = append(times, pts)
 	}
 	slices.Sort(times)
-	return times
+	return times, sc.Err()
 }
 
 // parseKeyframeCSV is scanKeyframes over a whole string — the shape the tests
 // use, and the reason the parse stayed separate from the ffprobe plumbing.
 func parseKeyframeCSV(out string) []float64 {
-	return scanKeyframes(strings.NewReader(out))
+	times, _ := scanKeyframes(strings.NewReader(out)) // a string reader can't fail
+	return times
 }
 
 // BuildBoundaries turns keyframe times into segment boundaries: greedily,

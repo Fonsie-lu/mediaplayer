@@ -37,8 +37,8 @@ func (m Model) doUnstar() Model {
 	return m
 }
 
-// mountLabel labels a star's mount. Stars are keyed by mount name, so the label
-// is that name — flagged when no configured mount carries it any more, which is
+// mountLabel labels a star's mount. Stars are keyed by mount identity (the
+// name, or the path of an unnamed mount), so the label is that — flagged when no configured mount carries it any more, which is
 // the one case the user needs to see (the star can still be removed, it just
 // points nowhere).
 func (m Model) mountLabel(name string) string {
@@ -47,7 +47,7 @@ func (m Model) mountLabel(name string) string {
 		mounts = m.cfg.Snapshot().Mounts
 	}
 	for _, mt := range mounts {
-		if mt.Name == name {
+		if mt.Identity() == name {
 			return name
 		}
 	}

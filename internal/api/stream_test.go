@@ -100,18 +100,18 @@ func TestPlanStreamQualityAndAudio(t *testing.T) {
 	}
 }
 
-// Segment URLs are per cookie, not per session instance, so a cached response
-// would be spliced into the next video or the next quality.
+// Segments are scratch files gone within minutes; a cached copy would only
+// fill the browser's disk cache.
 func TestStreamHLSSegmentsNotCacheable(t *testing.T) {
 	mux, mgr := testMux(t)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, transcode.SegName(0)), []byte("ts"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mgr.Adopt("sid1", &session.Session{ID: "sid1", Duration: 8, Dir: dir})
+	sid, _ := mgr.Add(&session.Session{Duration: 8, Dir: dir})
 
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/stream/hls/sid1/seg_00000.ts", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/stream/hls/"+sid+"/seg_00000.ts", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("segment: status %d, want 200", rec.Code)
 	}

@@ -465,6 +465,17 @@ try {
     insideNames.join(",") === previewNames.join(","),
     `${previewNames.join(",")} vs ${insideNames.join(",")}`,
   );
+  // A page rebuilt rather than restored from the bfcache (a reload, the
+  // Android WebView) used to come back on the first mount's root.
+  await page.reload({ waitUntil: "networkidle0" });
+  const restored = await page
+    .waitForFunction(
+      () => document.querySelector("#crumbs .cur")?.textContent === "sub",
+      { timeout: 5000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  check("a reload comes back to the directory in view", restored);
   await page.keyboard.press("h");
   await page.waitForFunction(() => !document.querySelector("#crumbs .cur"), {
     timeout: 5000,
@@ -738,7 +749,15 @@ try {
     // A server restart or the idle reaper drops the session under a playing
     // page; the next segment 404s and the player must reopen, not die.
     tolerated = /\/api\/stream\/hls\//;
-    await page.evaluate(() => fetch("/api/stream/close", { method: "POST" }));
+    // The session ID is the path segment before the playlist name.
+    const sid = playlistURL && playlistURL.split("/").slice(-2)[0];
+    await page.evaluate(
+      (id) =>
+        fetch("/api/stream/close?session=" + encodeURIComponent(id), {
+          method: "POST",
+        }),
+      sid,
+    );
     await page.$eval("#video", (v) => (v.currentTime = 75));
     check(
       "a lost session is reopened and playback carries on",
@@ -746,6 +765,56 @@ try {
       await statusText(),
     );
     tolerated = null;
+
+    // Every open is a session of its own. They used to share one cookie per
+    // browser, so a second tab's open replaced (and killed) the first's.
+    const page2 = await browser.newPage();
+    await page2.goto(
+      `${BASE}/player?mount=0&path=${encodeURIComponent("sub/nested/rec-mpeg2.ts")}`,
+      { waitUntil: "domcontentloaded" },
+    );
+    const page2Playing = await page2
+      .waitForFunction(
+        () => document.getElementById("video").currentTime > 0.5,
+        { timeout: 30000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    const firstStillOpen = await page.evaluate(
+      async (url) => (await fetch(url)).status,
+      playlistURL,
+    );
+    check(
+      "a second page's stream leaves the first page's session open",
+      page2Playing && firstStillOpen === 200,
+      `second playing=${page2Playing}, first playlist status ${firstStillOpen}`,
+    );
+    await page2.close();
+
+    // A deliberate seek to 0 is a position too: a quality switch right after
+    // it used to restart from the page's original ?t= start instead.
+    await page.$eval("#video", (v) => (v.currentTime = 0));
+    await page
+      .waitForFunction(() => document.getElementById("video").currentTime < 2, {
+        timeout: 15000,
+      })
+      .catch(() => {});
+    await page.select("#quality", "480");
+    const switched = await page
+      .waitForFunction(
+        () =>
+          /^transcode/.test(document.getElementById("status").textContent) &&
+          document.getElementById("video").currentTime > 0.5,
+        { timeout: 30000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    const afterSwitch = await page.$eval("#video", (v) => v.currentTime);
+    check(
+      "a quality switch right after a seek to 0 starts from 0",
+      switched && afterSwitch < 15,
+      `switched=${switched}, currentTime ${afterSwitch.toFixed(1)}`,
+    );
 
     // A seek onto an exact segment boundary is the case that used to cost two
     // ffmpeg batches and sometimes never played: the media a segment carries
@@ -770,7 +839,7 @@ try {
       await statusText(),
     );
     // Segment starts out of the server's own playlist, read from inside the
-    // page so the session cookie applies.
+    // page so the request comes from the same origin.
     const bounds = playlistURL
       ? await page.evaluate(async (url) => {
           const res = await fetch(url, { credentials: "same-origin" });

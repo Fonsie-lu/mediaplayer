@@ -9,6 +9,7 @@ import (
 	"flag"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,14 +45,7 @@ func main() {
 	noTUI := flag.Bool("no-tui", false, "run headless (no terminal UI even on a TTY)")
 	flag.Parse()
 
-	// The TUI takes over the terminal by default when attached to one; redirect
-	// the logger into an in-memory buffer (its Logs tab) so it doesn't corrupt
-	// the rendered UI. Headless runs keep logging to stderr as before.
 	useTUI := !*noTUI && isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
-	if useTUI {
-		log.SetFlags(0)
-		log.SetOutput(applog.Default)
-	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -79,11 +73,26 @@ func main() {
 	}
 	mux := newMux(h, web)
 
+	// Bind before the TUI takes the terminal: a port already in use must fail
+	// here, on stderr, rather than from a goroutine while the TUI owns the
+	// screen (log.Fatalf there exits without restoring the terminal).
 	addr := cfg.Addr()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// Everything that can fail fatally at startup has run, so its message
+	// reached stderr. From here the TUI, when it runs, takes over the terminal;
+	// the logger goes into an in-memory buffer (its Logs tab) so it doesn't
+	// corrupt the rendered UI. Headless runs keep logging to stderr.
+	if useTUI {
+		log.SetFlags(0)
+		log.SetOutput(applog.Default)
 	}
 
 	snap := cfg.Snapshot()
@@ -94,8 +103,8 @@ func main() {
 	}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server: %v", err)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("server: %v", err)
 		}
 	}()
 
@@ -121,7 +130,7 @@ func main() {
 	}
 
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	<-quit
 	shutdown()
 }

@@ -10,7 +10,7 @@ import { currentEntry, openEntry } from "./listing.js";
 // The geometry lives in the CSS (:root --sheet-* in browser.css) and is read
 // back here, so the box this fit calculation targets and the box the browser
 // actually paints can't drift apart.
-export function sheetMetric(name) {
+function sheetMetric(name) {
   return parseFloat(
     getComputedStyle(document.documentElement).getPropertyValue(name),
   );
@@ -19,7 +19,7 @@ export function sheetMetric(name) {
 // Pick the tile size that fills the most of the 80% box while still fitting
 // every frame — that's what keeps the sheet scroll-free at any window size or
 // frame count, instead of leaving it to CSS wrapping.
-export function layoutSheet() {
+function layoutSheet() {
   const shots = state.sheet;
   if (!shots || !shots.length) return;
   const gap = sheetMetric("--sheet-gap"),
@@ -49,8 +49,8 @@ export function layoutSheet() {
 
 // A drag-resize fires resize ~60×/s and each layout re-scales up to 60
 // images; coalesce to one per frame.
-export let sheetResizePending = false;
-export function onSheetResize() {
+let sheetResizePending = false;
+function onSheetResize() {
   if (sheetResizePending) return;
   sheetResizePending = true;
   requestAnimationFrame(() => {

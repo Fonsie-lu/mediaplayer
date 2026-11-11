@@ -13,6 +13,7 @@ import {
   saveCursor,
   loadCursor,
   loadJSON,
+  store,
   setActiveCol,
   clearFilter,
 } from "./dom.js";
@@ -45,6 +46,12 @@ export async function toggleStar() {
   }
 }
 
+// The directory in view, per tab: a page the browser rebuilds rather than
+// restores from the bfcache (a reload, a WebView — the Android app has no
+// bfcache — or the player's location.href fallback) comes back to it instead
+// of the first mount's root.
+const LOCATION_KEY = "mp.location";
+
 export async function loadMounts() {
   try {
     state.mounts = await api.mounts();
@@ -52,10 +59,22 @@ export async function loadMounts() {
     status("mount load failed: " + e.message, "err");
     return;
   }
-  renderMounts();
-  if (state.mounts.length) selectMount(0);
-  else status("no mounts configured — edit config.json", "err");
   setActiveCol("files");
+  if (!state.mounts.length) {
+    renderMounts();
+    status("no mounts configured — edit config.json", "err");
+    return;
+  }
+  const loc = loadJSON(LOCATION_KEY, true);
+  const i = Number.isInteger(loc.mount) && loc.mount < state.mounts.length ? loc.mount : 0;
+  state.mountIdx = i;
+  state.path = i === loc.mount && typeof loc.path === "string" ? loc.path : "";
+  renderMounts();
+  // A remembered directory may have been deleted or renamed since.
+  if ((await loadDir()) === false && state.path) {
+    state.path = "";
+    await loadDir();
+  }
 }
 
 // Rows carry their index and nothing else: clicks are handled by one
@@ -77,18 +96,40 @@ export async function selectMount(i) {
   state.path = "";
   clearFilter();
   renderMounts();
-  await loadDir();
+  // A remembered directory may have been deleted or renamed since.
+  if ((await loadDir()) === false && state.path) {
+    state.path = "";
+    await loadDir();
+  }
 }
 
+// Bumped by every loadDir. Listings return in any order — a slow mount
+// switched away from answers after the fast one switched to — and a stale one
+// must never be applied: its rel_paths belong to another mount or directory,
+// and a delete or rename acts on the focused rel_path under state.mountIdx.
+let loadGen = 0;
+
+// Resolves true when the listing loaded, false when it failed, and null when
+// a newer loadDir superseded it.
 export async function loadDir(presetFocus) {
+  const gen = ++loadGen;
   dirPreviewCache.clear();
+  let entries;
   try {
     const r = await api.browse(state.mountIdx, state.path, state.sort);
-    state.entries = r.entries || [];
+    entries = r.entries || [];
+    store(
+      LOCATION_KEY,
+      JSON.stringify({ mount: state.mountIdx, path: state.path }),
+      true,
+    );
   } catch (e) {
+    if (gen !== loadGen) return null;
     status(e.message, "err");
-    state.entries = [];
+    entries = null;
   }
+  if (gen !== loadGen) return null;
+  state.entries = entries || [];
   applyFilter();
   refreshList(presetFocus != null ? presetFocus : loadCursor());
   renderCrumbs();
@@ -152,12 +193,13 @@ function renderFiles() {
   scrollFocusIntoView(el.fileList.children[state.focus]);
 }
 
+function iconFor(e) {
+  if (e.is_dir) return ICONS.folder;
+  return e.kind === "video" ? ICONS.video : ICONS.other;
+}
+
 function fileRow(e, i, resume) {
-  const icon = e.is_dir
-    ? ICONS.folder
-    : e.kind === "video"
-      ? ICONS.video
-      : ICONS.other;
+  const icon = iconFor(e);
   let meta = e.is_dir ? "" : `${fmtSize(e.size)} · ${fmtDate(e.ctime)}`;
   const r = resume[`${state.mountIdx}:${e.rel_path}`];
   if (r && r.dur) {
@@ -207,9 +249,28 @@ const dirPreviewCacheMax = 64;
 // pane the user only glances at; the row count is reported either way.
 const dirPreviewMax = 200;
 
+// The thumbnail load in flight, and the timer that will start the next one.
+// A held `j` crosses rows faster than thumbnails are made, so a load starts
+// only once the cursor has rested for previewDelayMs, and a superseded one is
+// cancelled (src="" aborts the fetch, which the server sees as the request
+// going away) instead of queueing up a generation per row passed.
+let previewImg = null;
+let previewTimer = 0;
+const previewDelayMs = 120;
+
+function cancelImagePreview() {
+  clearTimeout(previewTimer);
+  if (previewImg) {
+    previewImg.onload = previewImg.onerror = null;
+    previewImg.src = "";
+    previewImg = null;
+  }
+}
+
 function updatePreview() {
   const e = currentEntry();
   const reqId = ++state.previewReq;
+  cancelImagePreview();
   if (e && e.is_dir) {
     el.previewImg.removeAttribute("src");
     previewDir(e, reqId);
@@ -222,17 +283,23 @@ function updatePreview() {
       : "";
     return;
   }
-  const url = api.previewURL(state.mountIdx, e.rel_path, 600);
-  const img = new Image();
-  img.onload = () => {
-    if (reqId !== state.previewReq) return;
-    el.previewImg.src = url;
-  };
-  img.onerror = () => {
-    if (reqId !== state.previewReq) return;
-    el.previewImg.removeAttribute("src");
-  };
-  img.src = url;
+  const url = api.previewURL(state.mountIdx, e.rel_path, 600, e.mtime);
+  el.previewImg.removeAttribute("src");
+  previewTimer = setTimeout(() => {
+    const img = new Image();
+    previewImg = img;
+    img.onload = () => {
+      if (reqId !== state.previewReq) return;
+      previewImg = null;
+      el.previewImg.src = url;
+    };
+    img.onerror = () => {
+      if (reqId !== state.previewReq) return;
+      previewImg = null;
+      el.previewImg.removeAttribute("src");
+    };
+    img.src = url;
+  }, previewDelayMs);
   el.previewMeta.innerHTML = [
     row("name", e.name),
     row("size", fmtSize(e.size)),
@@ -312,14 +379,9 @@ function dirPreviewHTML(entries) {
 // head rows' container) is a descendant selector, so a `meta` class in here
 // inherits its `width: 100%` and squeezes the filename to zero width.
 function dirPreviewRow(c) {
-  const icon = c.is_dir
-    ? ICONS.folder
-    : c.kind === "video"
-      ? ICONS.video
-      : ICONS.other;
   return (
     `<li class="${c.is_dir ? "dir" : c.kind}">` +
-    `<span class="ic">${icon}</span>` +
+    `<span class="ic">${iconFor(c)}</span>` +
     `<span class="name">${escape(c.name)}</span></li>`
   );
 }
@@ -400,7 +462,7 @@ export function openEntry(e, startSec) {
 
 // Park the cursor on a named entry after a load that changed the listing —
 // the index isn't known until the load lands, so this runs after loadDir.
-function focusByName(name) {
+export function focusByName(name) {
   const idx = state.filtered.findIndex((e) => e.name === name);
   if (idx < 0) return;
   setFocus(idx);

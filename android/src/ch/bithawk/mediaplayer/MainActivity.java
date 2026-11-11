@@ -16,7 +16,6 @@ import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -85,10 +84,6 @@ public class MainActivity extends Activity {
         s.setLoadWithOverviewMode(true);
         s.setSupportZoom(false);
         s.setBuiltInZoomControls(false);
-        // The session cookie (mp_sid) is what ties a browser to its transcode
-        // session, so it has to survive across app launches.
-        CookieManager.getInstance().setAcceptCookie(true);
-
         web.addJavascriptInterface(new Bridge(), "MPHost");
         web.setWebViewClient(new Client());
         web.setWebChromeClient(new Chrome());
@@ -365,10 +360,29 @@ public class MainActivity extends Activity {
                 getActionBar().show();
             }
             getWindow().getDecorView().setSystemUiVisibility(savedSystemUi);
+            // Fullscreen forced the screen on; hand the decision back to the
+            // page's media state. Paused before leaving fullscreen, nothing
+            // else would ever clear the flag and the screen never dims.
+            applyAwake();
             if (customViewCallback != null) {
                 customViewCallback.onCustomViewHidden();
                 customViewCallback = null;
             }
+        }
+    }
+
+    /** The page's last MPHost.awake() report: is media playing. UI thread only. */
+    private boolean mediaPlaying;
+
+    /**
+     * Keeps the screen on while media plays or the video is fullscreen, and
+     * lets it dim otherwise. UI thread only.
+     */
+    private void applyAwake() {
+        if (mediaPlaying || customView != null) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
     }
 
@@ -383,11 +397,8 @@ public class MainActivity extends Activity {
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
-                    if (on) {
-                        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    } else if (customView == null) {
-                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    }
+                    mediaPlaying = on;
+                    applyAwake();
                 }
             });
         }
