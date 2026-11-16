@@ -72,7 +72,7 @@ func (h *Handler) sheet(w http.ResponseWriter, r *http.Request) {
 	// ffmpegthumbnailer can only write to a file — its stdout mode interleaves
 	// progress lines into the image data — so the frames make a brief stop on
 	// disk in here.
-	dir, err := os.MkdirTemp("", session.SheetTempPrefix)
+	dir, err := session.MkdirTemp(session.SheetTempPrefix)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

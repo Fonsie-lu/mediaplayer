@@ -100,9 +100,16 @@
       <div id="status" class="status"></div>
     </div>
 
-    <!-- hls.js for non-native HLS browsers (Chrome/Firefox). Optional; Safari has native HLS. -->
+    <!-- hls.js for non-native HLS browsers (Chrome/Firefox). Optional; Safari has native HLS.
+         The integrity hash pins the exact file (it is the npm package's own
+         dist/hls.min.js, byte for byte), so the CDN can't serve this page
+         anything else; a mismatch fires onerror like any failed load. Bumping
+         the version means recomputing it:
+           curl -s <url> | openssl dgst -sha384 -binary | openssl base64 -A -->
     <script
-      src="https://cdn.jsdelivr.net/npm/hls.js@1.7.0/dist/hls.min.js"
+      src="https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js"
+      integrity="sha384-p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
+      crossorigin="anonymous"
       onerror="window.__hlsjsFailed = true"
     ></script>
     <script src="/js/api.js"></script>

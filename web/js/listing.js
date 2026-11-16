@@ -23,13 +23,14 @@ function starKey(e) {
   return `${state.mountIdx}:${e.rel_path}`;
 }
 
+// A failed fetch keeps the set the page already has (empty at start-up):
+// this runs again after every rename and delete, and one dropped request
+// there shouldn't blank every star on screen.
 export async function loadStars() {
   try {
     const refs = await api.stars();
     state.stars = new Set(refs.map((r) => `${r.mount}:${r.path}`));
-  } catch (_) {
-    state.stars = new Set();
-  }
+  } catch (_) {}
 }
 
 export async function toggleStar() {
@@ -47,9 +48,9 @@ export async function toggleStar() {
 }
 
 // The directory in view, per tab: a page the browser rebuilds rather than
-// restores from the bfcache (a reload, a WebView — the Android app has no
-// bfcache — or the player's location.href fallback) comes back to it instead
-// of the first mount's root.
+// restores from the bfcache (a reload, the player's location.href fallback,
+// an embedded browser that keeps no bfcache) comes back to it instead of the
+// first mount's root.
 const LOCATION_KEY = "mp.location";
 
 export async function loadMounts() {
@@ -66,14 +67,21 @@ export async function loadMounts() {
     return;
   }
   const loc = loadJSON(LOCATION_KEY, true);
-  const i = Number.isInteger(loc.mount) && loc.mount < state.mounts.length ? loc.mount : 0;
+  const remembered =
+    Number.isInteger(loc.mount) &&
+    loc.mount >= 0 &&
+    loc.mount < state.mounts.length;
+  const i = remembered ? loc.mount : 0;
   state.mountIdx = i;
   state.path = i === loc.mount && typeof loc.path === "string" ? loc.path : "";
   renderMounts();
-  // A remembered directory may have been deleted or renamed since.
+  // A remembered directory may have been deleted or renamed since: fall back
+  // to the mount root rather than sit on an empty listing of a path that is
+  // gone. The error the first attempt put in the status bar is about a
+  // directory nobody asked for, so a successful fallback clears it.
   if ((await loadDir()) === false && state.path) {
     state.path = "";
-    await loadDir();
+    if (await loadDir()) status("");
   }
 }
 
@@ -96,11 +104,7 @@ export async function selectMount(i) {
   state.path = "";
   clearFilter();
   renderMounts();
-  // A remembered directory may have been deleted or renamed since.
-  if ((await loadDir()) === false && state.path) {
-    state.path = "";
-    await loadDir();
-  }
+  await loadDir();
 }
 
 // Bumped by every loadDir. Listings return in any order — a slow mount
@@ -136,6 +140,7 @@ export async function loadDir(presetFocus) {
   // Not awaited: a different directory may sit on a different filesystem, but
   // the number is a sidebar detail — the listing must not wait on statfs.
   refreshDisk();
+  return entries !== null;
 }
 
 export function applyFilter() {
@@ -474,5 +479,9 @@ export function goUp() {
   saveCursor();
   state.path = state.path.split("/").slice(0, -1).join("/");
   clearFilter();
-  loadDir().then(() => focusByName(childName));
+  // Only on the listing this call loaded: a superseded load resolves after a
+  // newer one has put a different directory on screen.
+  loadDir().then((loaded) => {
+    if (loaded) focusByName(childName);
+  });
 }

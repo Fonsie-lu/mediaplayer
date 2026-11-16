@@ -6,6 +6,7 @@
 import { state, el, status, escape, setActiveCol, store } from "./dom.js";
 import {
   loadDir,
+  loadStars,
   currentEntry,
   applyFilter,
   refreshList,
@@ -49,6 +50,10 @@ export function askRename() {
       const v = document.getElementById("_new").value.trim();
       if (!v) return;
       await api.rename(state.mountIdx, e.rel_path, v);
+      // The server moves the stars at and below the entry along with it;
+      // the page's copy is keyed by path, so it has to be read again or the
+      // renamed entry loses its ★ here until the next reload.
+      await loadStars();
       await loadDir();
       // Follow the entry: a rename changes its ctime and name, so under
       // either sort it may have moved away from the cursor's old index.
@@ -75,6 +80,7 @@ export function askDelete() {
     ok: "Delete",
     onOk: async () => {
       await api.del(state.mountIdx, e.rel_path);
+      await loadStars(); // the server dropped the stars under it
       await loadDir(); // refreshes the disk widget too
       status("deleted", "ok");
     },

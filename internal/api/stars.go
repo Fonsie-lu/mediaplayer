@@ -2,14 +2,20 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
 	"log"
 	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"mediaplayer/internal/config"
 )
@@ -208,21 +214,37 @@ func (s *StarStore) Remove(ref StarRef) error {
 func (s *StarStore) relocate(mount, oldRel, newRel string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	before := maps.Clone(s.set)
-	changed := false
-	for k, ref := range s.set {
+	return s.rewrite(func(ref StarRef) (StarRef, bool) {
 		if ref.Mount != mount {
-			continue
+			return ref, true
 		}
 		rest, ok := strings.CutPrefix(ref.Path, oldRel)
 		if !ok || (rest != "" && !strings.HasPrefix(rest, "/")) {
+			return ref, true
+		}
+		ref.Path = newRel + rest
+		return ref, newRel != ""
+	})
+}
+
+// rewrite passes every star through fn, which returns the ref to keep in its
+// place and whether to keep it at all, then persists if anything changed.
+// Caller holds mu.
+//
+// It walks a copy of the set: rewriting a map while ranging over it leaves it
+// to the runtime whether a re-keyed entry is visited a second time.
+func (s *StarStore) rewrite(fn func(StarRef) (StarRef, bool)) error {
+	before := maps.Clone(s.set)
+	changed := false
+	for _, ref := range s.list() {
+		next, keep := fn(ref)
+		if keep && next == ref {
 			continue
 		}
-		delete(s.set, k)
 		changed = true
-		if newRel != "" {
-			ref.Path = newRel + rest
-			s.set[ref.key()] = ref
+		delete(s.set, ref.key())
+		if keep {
+			s.set[next.key()] = next
 		}
 	}
 	if !changed {
@@ -233,6 +255,172 @@ func (s *StarStore) relocate(mount, oldRel, newRel string) error {
 		return err
 	}
 	return nil
+}
+
+// PruneMissing drops the stars whose entry no longer exists and reports how
+// many it dropped. Rename and delete through the API keep the list in step
+// (relocate), but a file removed any other way — a shell, another machine on
+// the share, a recording that expired — left its star behind for good: nothing
+// on the page shows a star without an entry, so only the TUI could remove it.
+// main runs this once at startup.
+//
+// It removes only what it can tell is gone (see entryGone), and leaves alone a
+// star whose mount is no longer configured: there is no directory to check it
+// against, and the TUI lists those as "(no such mount)" to be removed by hand.
+//
+// The filesystem is read without mu held — a stalled network mount would
+// otherwise block every star request behind it.
+func (s *StarStore) PruneMissing() int {
+	mounts := s.cfg.Snapshot().Mounts
+	gone := map[string]bool{}
+	for _, ref := range s.List() {
+		i := slices.IndexFunc(mounts, func(m config.Mount) bool { return m.Identity() == ref.Mount })
+		if i < 0 {
+			continue
+		}
+		if entryGone(mounts[i].Path, ref.Path) {
+			gone[ref.key()] = true
+		}
+	}
+	if len(gone) == 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	err := s.rewrite(func(ref StarRef) (StarRef, bool) {
+		if !gone[ref.key()] {
+			return ref, true
+		}
+		removed++
+		log.Printf("stars: dropped %s:%s, which no longer exists", ref.Mount, ref.Path)
+		return ref, false
+	})
+	if err != nil {
+		log.Printf("stars: could not persist the clean-up: %v", err)
+		return 0
+	}
+	return removed
+}
+
+// entryGone reports whether rel, inside the mount at root, has been deleted —
+// as opposed to merely being out of reach right now. The difference matters
+// because a media mount is typically a network share or a removable disk, and
+// one that isn't mounted when the server starts looks exactly like one whose
+// files were all deleted: an empty directory where the mountpoint is. Trusting
+// that would wipe every star on the disk the first time the server came up
+// before the disk did.
+//
+// So an entry counts as gone only when it is missing **and** the nearest
+// directory above it that still exists has something else in it — which is
+// what a deletion leaves behind, and not what an unmounted mountpoint looks
+// like, at the mount root or anywhere below it (a mount spanning several disks).
+// The price is a star under a directory that was emptied but kept: it stays
+// until the directory goes too. Any other failure (permissions, I/O, a path
+// that leaves the mount) keeps the star as well.
+//
+// Lstat, not Stat: a dangling symlink is still an entry in the listing.
+func entryGone(root, rel string) bool {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	full, err := safeJoin(root, rel)
+	if err != nil || full == absRoot {
+		return false
+	}
+	if _, err := os.Lstat(full); !isMissing(err) {
+		return false
+	}
+	// safeJoin keeps full inside absRoot, so this walk ends at absRoot at the
+	// latest.
+	for dir := filepath.Dir(full); ; dir = filepath.Dir(dir) {
+		populated, err := hasEntries(dir)
+		switch {
+		case err == nil:
+			return populated
+		case !isMissing(err) || dir == absRoot:
+			return false
+		}
+	}
+}
+
+// isMissing reports whether err says the path does not exist. ENOTDIR is the
+// same answer in a different spelling: a component of the path is now a file.
+func isMissing(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
+// hasEntries reports whether dir contains anything, reading one name rather
+// than the whole listing.
+func hasEntries(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return len(names) > 0, nil
+}
+
+// FollowMounts carries the stars across a mount list edit that renamed a
+// mount. Stars are keyed by mount identity (see StarRef), so giving a mount a
+// new name used to orphan every star under it — still listed in the TUI, as
+// "(no such mount)", but gone from the page. Both ways of editing mounts call
+// this: the TUI's form and POST /api/config.
+//
+// before and after are the mount lists either side of the edit.
+func (s *StarStore) FollowMounts(before, after []config.Mount) error {
+	renames := renamedMounts(before, after)
+	if len(renames) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rewrite(func(ref StarRef) (StarRef, bool) {
+		if to, ok := renames[ref.Mount]; ok {
+			ref.Mount = to
+		}
+		return ref, true
+	})
+}
+
+// renamedMounts maps old identity → new identity for the mounts an edit
+// renamed: an identity that left the list while exactly one new identity
+// appeared on the same path. A mount list arrives whole, with nothing saying
+// which entry was edited, so the directory is what ties the two together. A
+// mount whose path changed along with its name is a different directory and is
+// not followed, and neither is an ambiguous match — an orphaned star can be
+// re-made, one silently attached to the wrong mount cannot be noticed.
+func renamedMounts(before, after []config.Mount) map[string]string {
+	had, has := map[string]bool{}, map[string]bool{}
+	for _, m := range before {
+		had[m.Identity()] = true
+	}
+	for _, m := range after {
+		has[m.Identity()] = true
+	}
+	out := map[string]string{}
+	for _, old := range before {
+		if has[old.Identity()] {
+			continue // still there under the same identity
+		}
+		fresh := map[string]bool{}
+		for _, m := range after {
+			if m.Path == old.Path && !had[m.Identity()] {
+				fresh[m.Identity()] = true
+			}
+		}
+		if len(fresh) == 1 {
+			for to := range fresh {
+				out[old.Identity()] = to
+			}
+		}
+	}
+	return out
 }
 
 func (h *Handler) getStars(w http.ResponseWriter, r *http.Request) {

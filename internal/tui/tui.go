@@ -6,6 +6,8 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -105,9 +107,10 @@ type Model struct {
 	confirmMsg string
 }
 
-// Run starts the TUI and blocks until the user quits. It returns restart=true
-// when the user requested a re-exec of the process.
-func Run(cfg *config.Config, stars *api.StarStore, logs *applog.Store, addr string) (bool, error) {
+// Run starts the TUI and blocks until the user quits or ctx is cancelled (how
+// main asks it to leave on SIGHUP). It returns restart=true when the user
+// requested a re-exec of the process.
+func Run(ctx context.Context, cfg *config.Config, stars *api.StarStore, logs *applog.Store, addr string) (bool, error) {
 	name := textinput.New()
 	name.Placeholder = "name"
 	name.CharLimit = 64
@@ -129,8 +132,13 @@ func Run(cfg *config.Config, stars *api.StarStore, logs *applog.Store, addr stri
 	m.reloadMounts()
 	m.reloadStars()
 
-	p := tea.NewProgram(m)
+	p := tea.NewProgram(m, tea.WithContext(ctx))
 	fm, err := p.Run()
+	if errors.Is(err, tea.ErrInterrupted) || ctx.Err() != nil {
+		// A SIGINT from outside (`kill -INT`; ctrl+c arrives as a key instead)
+		// or the caller cancelling is a request to quit, not a TUI failure.
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

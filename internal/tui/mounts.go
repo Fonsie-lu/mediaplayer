@@ -94,6 +94,15 @@ func (m Model) saveEdit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Names are the identity stars are stored under (config.Mount.Identity),
+	// so two mounts sharing one would share — and mis-show — each other's.
+	for i, mt := range m.mounts {
+		if i != m.editIdx && mt.Name == name {
+			m.status = fmt.Sprintf("a mount named %q already exists", name)
+			return m, nil
+		}
+	}
+
 	mounts := append([]config.Mount(nil), m.mounts...)
 	if m.editIdx >= 0 && m.editIdx < len(mounts) {
 		mounts[m.editIdx] = config.Mount{Name: name, Path: path}
@@ -105,11 +114,16 @@ func (m Model) saveEdit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.editing = false
+	before := m.mounts
 	m.reloadMounts()
 	if m.editIdx < 0 {
 		m.mSel = max(0, len(m.mounts)-1)
 	}
 	m.status = "saved"
+	// A renamed mount takes its stars along (they are keyed by mount name).
+	if err := m.stars.FollowMounts(before, m.mounts); err != nil {
+		m.status = "saved, but stars could not follow: " + err.Error()
+	}
 	return m, nil
 }
 

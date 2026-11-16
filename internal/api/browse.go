@@ -2,6 +2,7 @@ package api
 
 import (
 	"cmp"
+	"errors"
 	"io/fs"
 	"net/http"
 	"os"
@@ -61,7 +62,14 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := os.ReadDir(full)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		// A directory that is gone (deleted or renamed since the page last saw
+		// it) is the client asking for something that isn't there, not the
+		// server failing.
+		status := http.StatusInternalServerError
+		if errors.Is(err, fs.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		writeErr(w, status, err.Error())
 		return
 	}
 	out := make([]FileEntry, 0, len(entries))

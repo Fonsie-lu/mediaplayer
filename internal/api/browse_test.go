@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -133,5 +134,26 @@ func TestBrowseFollowsInMountSymlinks(t *testing.T) {
 	}
 	if names(res.Entries)[0] != "linkdir" {
 		t.Errorf("order = %v, want the linked folder sorted with the folders", names(res.Entries))
+	}
+}
+
+// A directory that no longer exists is a 404, which is what tells the page its
+// remembered location is gone; anything else that fails to list stays a 500.
+func TestBrowseMissingDirectoryIs404(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{Cfg: config.New(config.Snapshot{Mounts: []config.Mount{{Name: "m", Path: root}}})}
+	for path, want := range map[string]int{
+		"":         http.StatusOK,
+		"gone":     http.StatusNotFound,
+		"file.txt": http.StatusInternalServerError, // not a directory
+	} {
+		rec := httptest.NewRecorder()
+		h.browse(rec, httptest.NewRequest("GET", "/api/browse?mount=0&path="+path, nil))
+		if rec.Code != want {
+			t.Errorf("browse %q: status %d, want %d", path, rec.Code, want)
+		}
 	}
 }

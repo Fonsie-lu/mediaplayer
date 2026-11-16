@@ -150,7 +150,7 @@ func (h *Handler) streamOpen(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Err() != nil {
 		return
 	}
-	dir, err := os.MkdirTemp("", session.SessTempPrefix)
+	dir, err := session.MkdirTemp(session.SessTempPrefix)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

@@ -189,6 +189,17 @@ writeFileSync(
   }),
 );
 
+// A star left over from a file deleted while the server was down, beside one
+// whose file is there: startup must drop the first and keep the second.
+spawnSync("mkdir", ["-p", join(work, "xdg")]);
+writeFileSync(
+  join(work, "xdg", "mediaplayer-stars.json"),
+  JSON.stringify([
+    { mount: "testmedia", path: "deleted-while-down.mp4" },
+    { mount: "second", path: "two.txt" },
+  ]),
+);
+
 // ---------- server ----------
 
 // XDG_CONFIG_HOME is redirected into the scratch dir, not just -config: the
@@ -216,12 +227,31 @@ async function waitForServer() {
   return false;
 }
 
+// SIGTERM, so the server shuts down the way it does in service: sessions
+// closed, their ffmpeg batches stopped, the segment dirs removed. A SIGKILL
+// here left a /tmp/mediaplayer-sess-* dir and a transcode running behind every
+// run. The kill is only the fallback for a server that won't go.
+function stopServer() {
+  return new Promise((resolve) => {
+    if (server.exitCode !== null || server.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const force = setTimeout(() => server.kill("SIGKILL"), 8000);
+    server.once("exit", () => {
+      clearTimeout(force);
+      resolve();
+    });
+    server.kill("SIGTERM");
+  });
+}
+
 let browser;
 async function cleanup() {
   try {
     await browser?.close();
   } catch {}
-  server.kill("SIGKILL");
+  await stopServer();
   rmSync(work, { recursive: true, force: true });
 }
 
@@ -231,6 +261,25 @@ try {
   if (!(await waitForServer())) {
     throw new Error(`server never came up:\n${serverLog.join("")}`);
   }
+
+  // Before any page stars anything, so the list is only what was seeded.
+  section("stars at startup");
+  let seeded = [];
+  for (let i = 0; i < 30; i++) {
+    seeded = await (await fetch(`${BASE}/api/stars`)).json();
+    if (seeded.length < 2) break;
+    await sleep(100); // the clean-up runs beside the listener coming up
+  }
+  check(
+    "a star whose file is gone is dropped at startup, the others kept",
+    seeded.length === 1 && seeded[0].path === "two.txt",
+    JSON.stringify(seeded),
+  );
+  await fetch(`${BASE}/api/stars/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mount: "1", path: "two.txt" }),
+  });
 
   browser = await puppeteer.launch({
     executablePath: CHROME,
@@ -465,8 +514,8 @@ try {
     insideNames.join(",") === previewNames.join(","),
     `${previewNames.join(",")} vs ${insideNames.join(",")}`,
   );
-  // A page rebuilt rather than restored from the bfcache (a reload, the
-  // Android WebView) used to come back on the first mount's root.
+  // A page rebuilt rather than restored from the bfcache (a reload) used to
+  // come back on the first mount's root.
   await page.reload({ waitUntil: "networkidle0" });
   const restored = await page
     .waitForFunction(
@@ -616,6 +665,116 @@ try {
   check("star survives a reload (server-side)", starAfterReload !== null);
   const diskVisible = await page.$eval("#disk", (d) => !d.hidden);
   check("disk widget resolved the browsed filesystem", diskVisible === true);
+
+  // The server moves a renamed entry's stars along with it, and the page's
+  // own copy is keyed by path: without re-reading it the renamed entry lost
+  // its ★ here, and the next `y` — meant to star it — silently unstarred it.
+  // Done in the second mount, whose files no other check looks at by name.
+  section("stars follow a rename");
+  await page.keyboard.press("2");
+  await page.waitForFunction(
+    () =>
+      document.querySelector('#mount-list li[data-i="1"]')?.dataset.active ===
+        "true" &&
+      document.querySelector('#file-list li[data-i="0"] .name')
+        ?.textContent === "nested",
+    { timeout: 5000 },
+  );
+  await page.keyboard.press("G");
+  const beforeRename = await focusedName();
+  await page.keyboard.press("y");
+  await page.waitForFunction(
+    () => document.querySelector('#file-list li[data-focus="true"] .star'),
+    { timeout: 3000 },
+  );
+  await page.keyboard.press("r");
+  await page.waitForSelector("#_new", { timeout: 3000 });
+  // The dialog selects the name's stem a tick after opening; typing before
+  // that lands would have part of the new name selected and overwritten.
+  await sleep(100);
+  await page.$eval("#_new", (i) => (i.value = ""));
+  await page.keyboard.type("renamed.txt");
+  await page.keyboard.press("Enter");
+  const starFollowed = await page
+    .waitForFunction(
+      () => {
+        const li = document.querySelector('#file-list li[data-focus="true"]');
+        return (
+          li?.querySelector(".name").textContent === "renamed.txt" &&
+          li.querySelector(".star") !== null
+        );
+      },
+      { timeout: 5000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  check(
+    "a renamed entry keeps its star and the cursor",
+    starFollowed,
+    `${beforeRename} -> ${await focusedName()}`,
+  );
+
+  // Deleting an entry drops its star on the server, so the star file never
+  // lists a path that no longer exists.
+  section("stars go with a delete");
+  await page.keyboard.press("d");
+  await page.waitForFunction(() => !document.querySelector("#modal").hidden, {
+    timeout: 3000,
+  });
+  await page.keyboard.press("Enter");
+  const starsAfterDelete = await page
+    .waitForFunction(
+      () =>
+        ![...document.querySelectorAll("#file-list li .name")].some(
+          (n) => n.textContent === "renamed.txt",
+        ),
+      { timeout: 5000 },
+    )
+    .then(() => fetch(`${BASE}/api/stars`))
+    .then((r) => r.json())
+    .catch((err) => String(err));
+  check(
+    "a deleted entry takes its star along",
+    Array.isArray(starsAfterDelete) &&
+      !starsAfterDelete.some((s) => s.path === "renamed.txt"),
+    JSON.stringify(starsAfterDelete),
+  );
+
+  // A remembered directory that has since gone must fall back to the mount
+  // root. The reload above covers the directory still being there; this is
+  // the other branch, which never ran: the load reported nothing on failure,
+  // so the page sat on an empty listing of the missing path.
+  section("a remembered directory that is gone");
+  await page.evaluate(() =>
+    sessionStorage.setItem(
+      "mp.location",
+      JSON.stringify({ mount: 0, path: "no-such-dir" }),
+    ),
+  );
+  tolerated = /\/api\/browse\?.*no-such-dir/;
+  await page.reload({ waitUntil: "networkidle0" });
+  const fellBackToRoot = await page
+    .waitForFunction(
+      () =>
+        !document.querySelector("#crumbs .cur") &&
+        [...document.querySelectorAll("#file-list li .name")].some(
+          (n) => n.textContent === "alpha.mp4",
+        ),
+      { timeout: 5000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  tolerated = null;
+  check(
+    "the page falls back to the mount root",
+    fellBackToRoot,
+    await page.$eval("#crumbs", (c) => c.textContent),
+  );
+  check(
+    "and leaves no error in the status bar",
+    (await page.$eval("#statusbar", (s) => s.textContent)) === "",
+    await page.$eval("#statusbar", (s) => s.textContent),
+  );
 
   section("player page");
   const playerErrors = [];

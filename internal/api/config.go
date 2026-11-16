@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 
 	"mediaplayer/internal/config"
@@ -23,9 +24,17 @@ func (h *Handler) postConfig(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &p) {
 		return
 	}
+	before := h.Cfg.Snapshot().Mounts
 	if err := h.Cfg.Replace(p.Mounts); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// The mounts are replaced by then, so a failure to move the stars along is
+	// logged rather than reported as the request failing (as in relocateStars).
+	if h.Stars != nil {
+		if err := h.Stars.FollowMounts(before, h.Cfg.Snapshot().Mounts); err != nil {
+			log.Printf("stars: could not follow renamed mounts: %v", err)
+		}
 	}
 	writeOK(w)
 }

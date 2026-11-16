@@ -2,6 +2,7 @@ package session
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -214,5 +215,58 @@ func TestSegmentCompleteDistrustsStoppingBatch(t *testing.T) {
 	}
 	if !segmentComplete(dir, 4, nil, &transcode.Batch{StartSeg: 20, Count: 16}) {
 		t.Error("a batch that doesn't cover the segment must not veto it")
+	}
+}
+
+// The janitor must tell a dead run's leftovers from the scratch dirs of
+// another instance that is still serving: it used to delete every matching
+// dir, so starting a second server killed the first one's streams.
+func TestCleanStaleTempDirsSparesLiveInstances(t *testing.T) {
+	root := t.TempDir()
+	const self, live = 100, 200 // 300 is a pid nobody has
+	dirs := map[string]bool{    // name -> survives
+		SessTempPrefix + "200-111":  true,  // another instance, running
+		ThumbTempPrefix + "200-222": true,  // its preview scratch too
+		SessTempPrefix + "300-333":  false, // its owner is gone
+		SheetTempPrefix + "100-444": false, // ours, from before a re-exec
+		SessTempPrefix + "555":      false, // legacy name, no pid
+		SessTempPrefix + "x-666":    false, // unparsable pid
+		SessTempPrefix + "200":      false, // no separator, so no pid field
+		"mediaplayer-previews":      true,  // the stable cache
+		"unrelated-200-777":         true,
+	}
+	for name := range dirs {
+		if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A plain file under a matching name is never touched.
+	file := filepath.Join(root, SessTempPrefix+"300-file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanStaleTempDirs(root, self, func(pid int) bool { return pid == live || pid == self })
+
+	for name, want := range dirs {
+		_, err := os.Stat(filepath.Join(root, name))
+		if got := err == nil; got != want {
+			t.Errorf("%s: survived=%t, want %t", name, got, want)
+		}
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Errorf("plain file removed: %v", err)
+	}
+}
+
+func TestMkdirTempCarriesPid(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	dir, err := MkdirTemp(SessTempPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, ours := tempDirOwner(filepath.Base(dir))
+	if !ours || pid != os.Getpid() {
+		t.Errorf("tempDirOwner(%q) = %d, %t; want this pid", filepath.Base(dir), pid, ours)
 	}
 }

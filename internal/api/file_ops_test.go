@@ -108,3 +108,19 @@ func TestStarsFollowRenameAndDelete(t *testing.T) {
 		t.Errorf("stars after delete = %v, want only showcase.mkv", refs)
 	}
 }
+
+// POST /api/config renames a mount by sending the list with a new name on the
+// same path; the stars under the old name must move with it.
+func TestStarsFollowMountRenameViaConfig(t *testing.T) {
+	mux, stars, root := fileOpsMux(t)
+	if got := postJSON(mux, "/api/stars/toggle", `{"mount":"0","path":"a.mkv"}`); got != http.StatusOK {
+		t.Fatalf("star: status %d", got)
+	}
+	body := `{"mounts":[{"name":"renamed","path":"` + root + `"}]}`
+	if got := postJSON(mux, "/api/config", body); got != http.StatusOK {
+		t.Fatalf("config: status %d", got)
+	}
+	if refs := stars.List(); len(refs) != 1 || refs[0] != (StarRef{Mount: "renamed", Path: "a.mkv"}) {
+		t.Errorf("stars after mount rename = %v, want a.mkv under \"renamed\"", refs)
+	}
+}

@@ -9,9 +9,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"mediaplayer/internal/transcode"
@@ -623,9 +624,9 @@ func (s *Session) shutdown() {
 
 // Temp-dir prefixes this process owns and normally removes itself. The
 // creators live in internal/api, but the startup janitor below is the reason
-// they have to be named at all, so the constants live with it — use these in
-// os.MkdirTemp rather than repeating the literal, or a rename silently orphans
-// the dirs instead of failing to compile.
+// they have to be named at all, so the constants live with it — create the
+// dirs through MkdirTemp below rather than repeating the literal, or a rename
+// silently orphans the dirs instead of failing to compile.
 const (
 	SessTempPrefix  = "mediaplayer-sess-"  // per-session HLS segment dir
 	SheetTempPrefix = "mediaplayer-sheet-" // per-/api/sheet-request frame scratch
@@ -636,21 +637,73 @@ const (
 // cache is deliberately absent — it is meant to survive restarts.
 var staleTempPrefixes = []string{SessTempPrefix, SheetTempPrefix, ThumbTempPrefix}
 
+// MkdirTemp creates a scratch dir under os.TempDir named
+// <prefix><pid>-<random>, prefix being one of the constants above.
+//
+// The pid is what lets the janitor tell a crashed run's leftovers from the
+// dirs of another instance that is still serving. Without it, starting a
+// second server on the machine — the e2e harness, a scratch-config run to
+// test a streaming change — deleted the segment dirs out from under whatever
+// the first one was playing.
+func MkdirTemp(prefix string) (string, error) {
+	return os.MkdirTemp("", prefix+strconv.Itoa(os.Getpid())+"-")
+}
+
+// tempDirOwner reports whether name is one of this program's scratch dirs and,
+// if so, the pid that created it — 0 for a name without one (made before the
+// dirs carried a pid), which has nobody left to ask and counts as stale.
+func tempDirOwner(name string) (pid int, ours bool) {
+	for _, p := range staleTempPrefixes {
+		rest, ok := strings.CutPrefix(name, p)
+		if !ok {
+			continue
+		}
+		if owner, _, found := strings.Cut(rest, "-"); found {
+			if n, err := strconv.Atoi(owner); err == nil && n > 0 {
+				return n, true
+			}
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// processAlive reports whether pid names a running process. EPERM counts: the
+// process exists, it just isn't ours to signal.
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
 // CleanStaleTempDirs removes leftovers matching staleTempPrefixes from previous
 // runs (e.g. after a crash or kill -9 of the server itself).
-// Call once at startup.
+// Call once at startup, before anything creates a scratch dir.
 func CleanStaleTempDirs() {
-	entries, err := os.ReadDir(os.TempDir())
+	cleanStaleTempDirs(os.TempDir(), os.Getpid(), processAlive)
+}
+
+// cleanStaleTempDirs is CleanStaleTempDirs with its inputs named, so a test
+// can run it against a scratch root and a fake process table.
+//
+// A dir is stale when the process that made it is gone — or is this one: the
+// TUI's restart re-execs under the same pid, and at startup nothing of ours
+// can be in use yet. A dir whose pid has since been reused by an unrelated
+// process is spared until that process exits too; the cost is a few MB sitting
+// in the temp dir for a while, against deleting a live server's segments.
+func cleanStaleTempDirs(root string, self int, alive func(pid int) bool) {
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if !e.IsDir() || !slices.ContainsFunc(staleTempPrefixes, func(p string) bool {
-			return strings.HasPrefix(e.Name(), p)
-		}) {
+		if !e.IsDir() {
 			continue
 		}
-		full := filepath.Join(os.TempDir(), e.Name())
+		owner, ours := tempDirOwner(e.Name())
+		if !ours || (owner != 0 && owner != self && alive(owner)) {
+			continue
+		}
+		full := filepath.Join(root, e.Name())
 		if err := os.RemoveAll(full); err != nil {
 			log.Printf("stale cleanup: %v", err)
 		} else {

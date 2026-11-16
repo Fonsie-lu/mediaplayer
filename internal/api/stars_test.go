@@ -2,8 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"mediaplayer/internal/config"
@@ -198,5 +200,156 @@ func TestStarsSaveCreatesConfigDir(t *testing.T) {
 	}
 	if got := readStarFile(t, path); len(got) != 1 {
 		t.Errorf("star file = %v, want the one entry", got)
+	}
+}
+
+// Stars are keyed by mount name, so renaming a mount used to orphan every star
+// under it. The directory is what ties the old name to the new one.
+func TestStarsFollowMountRename(t *testing.T) {
+	cfg := testCfg("films", "series")
+	path := filepath.Join(t.TempDir(), "stars.json")
+	s, err := NewStarStore(path, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []StarRef{{"films", "a.mkv"}, {"films", "dir/b.mkv"}, {"series", "c.mkv"}} {
+		if _, err := s.toggle(ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := cfg.Snapshot().Mounts
+	after := []config.Mount{{Name: "movies", Path: "/srv/films"}, before[1]}
+	if err := s.FollowMounts(before, after); err != nil {
+		t.Fatal(err)
+	}
+	want := []StarRef{{"movies", "a.mkv"}, {"movies", "dir/b.mkv"}, {"series", "c.mkv"}}
+	if got := s.List(); !slices.Equal(got, want) {
+		t.Errorf("after rename: %v, want %v", got, want)
+	}
+	if got := readStarFile(t, path); !slices.Equal(got, want) {
+		t.Errorf("on disk: %v, want %v", got, want)
+	}
+}
+
+func TestRenamedMounts(t *testing.T) {
+	m := func(name, path string) config.Mount { return config.Mount{Name: name, Path: path} }
+	cases := []struct {
+		name          string
+		before, after []config.Mount
+		want          map[string]string
+	}{
+		{"rename", []config.Mount{m("a", "/x")}, []config.Mount{m("b", "/x")}, map[string]string{"a": "b"}},
+		{"reorder only", []config.Mount{m("a", "/x"), m("b", "/y")}, []config.Mount{m("b", "/y"), m("a", "/x")}, nil},
+		{"path edit keeps the name", []config.Mount{m("a", "/x")}, []config.Mount{m("a", "/z")}, nil},
+		{"name and path both changed", []config.Mount{m("a", "/x")}, []config.Mount{m("b", "/z")}, nil},
+		{"deleted", []config.Mount{m("a", "/x"), m("b", "/y")}, []config.Mount{m("b", "/y")}, nil},
+		// The other mount on /x was there before: it is not a new name for a.
+		{"deleted beside a twin", []config.Mount{m("a", "/x"), m("b", "/x")}, []config.Mount{m("b", "/x")}, nil},
+		{"two new names on the path", []config.Mount{m("a", "/x")}, []config.Mount{m("b", "/x"), m("c", "/x")}, nil},
+		// An unnamed mount's identity is its path; naming it is a rename.
+		{"unnamed gets a name", []config.Mount{m("", "/x")}, []config.Mount{m("b", "/x")}, map[string]string{"/x": "b"}},
+	}
+	for _, c := range cases {
+		got := renamedMounts(c.before, c.after)
+		if len(got) == 0 && len(c.want) == 0 {
+			continue
+		}
+		if !maps.Equal(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// pruneStore is a star store over two real mount dirs, "m" and "other", and
+// an identity ("left") that no configured mount carries.
+func pruneStore(t *testing.T, refs ...StarRef) (s *StarStore, root, file string) {
+	t.Helper()
+	root = t.TempDir()
+	cfg := config.New(config.Snapshot{Mounts: []config.Mount{
+		{Name: "m", Path: root},
+		{Name: "other", Path: t.TempDir()},
+	}})
+	file = filepath.Join(t.TempDir(), "stars.json")
+	s, err := NewStarStore(file, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range refs {
+		if _, err := s.toggle(ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s, root, file
+}
+
+// A file deleted behind the server's back takes its star with it at the next
+// start; everything that still exists, or can't be checked, keeps its own.
+func TestStarsPruneMissing(t *testing.T) {
+	s, root, file := pruneStore(t,
+		StarRef{"m", "kept.mkv"},
+		StarRef{"m", "deleted.mkv"},
+		StarRef{"m", "show"},
+		StarRef{"m", "show/ep1.mkv"},
+		StarRef{"m", "now-a-file/ep1.mkv"},
+		StarRef{"m", "dangling"},
+		StarRef{"left", "a.mkv"},
+	)
+	touch(t, filepath.Join(root, "kept.mkv"))
+	touch(t, filepath.Join(root, "now-a-file"))
+	if err := os.Symlink(filepath.Join(root, "nowhere"), filepath.Join(root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.PruneMissing(); got != 4 {
+		t.Errorf("PruneMissing() = %d, want 4", got)
+	}
+	want := []StarRef{{"left", "a.mkv"}, {"m", "dangling"}, {"m", "kept.mkv"}}
+	if got := s.List(); !slices.Equal(got, want) {
+		t.Errorf("after prune: %v, want %v", got, want)
+	}
+	if got := readStarFile(t, file); !slices.Equal(got, want) {
+		t.Errorf("on disk: %v, want %v", got, want)
+	}
+	if got := s.PruneMissing(); got != 0 {
+		t.Errorf("second PruneMissing() = %d, want 0", got)
+	}
+}
+
+// A disk that isn't mounted yet looks like a mount whose files were all
+// deleted. Its stars must outlive that: an empty mountpoint proves nothing,
+// whether it is the mount root, a directory below it, or missing altogether.
+func TestStarsPruneSparesAnUnmountedDisk(t *testing.T) {
+	refs := []StarRef{{"m", "film.mkv"}, {"m", "dir/film.mkv"}, {"other", "disk1/film.mkv"}}
+	s, root, file := pruneStore(t, refs...)
+	before, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "m" is an empty directory; "other" has content beside an empty disk1.
+	other := s.cfg.Snapshot().Mounts[1].Path
+	touch(t, filepath.Join(other, "disk2", "film.mkv"))
+	if err := os.Mkdir(filepath.Join(other, "disk1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.PruneMissing(); got != 0 {
+		t.Errorf("PruneMissing() over empty mountpoints = %d, want 0", got)
+	}
+
+	// The mount path itself gone.
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.PruneMissing(); got != 0 {
+		t.Errorf("PruneMissing() over a missing mount path = %d, want 0", got)
+	}
+
+	want := []StarRef{{"m", "dir/film.mkv"}, {"m", "film.mkv"}, {"other", "disk1/film.mkv"}}
+	if got := s.List(); !slices.Equal(got, want) {
+		t.Errorf("stars = %v, want all of %v", got, want)
+	}
+	if after, err := os.Stat(file); err != nil || !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("star file was rewritten though nothing was pruned (err %v)", err)
 	}
 }

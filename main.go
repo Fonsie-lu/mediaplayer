@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,6 +56,9 @@ func main() {
 	// Wipe leftover transcode dirs from any prior crashed run before
 	// new sessions allocate names that could collide.
 	session.CleanStaleTempDirs()
+	// The preview cache is the one temp dir meant to outlive a run, so it is
+	// capped rather than swept.
+	api.TrimPreviewCache()
 
 	mgr := session.NewManager()
 	mgr.StartReaper()
@@ -102,22 +106,53 @@ func main() {
 		log.Printf("  [%d] %s -> %s", i, m.Name, m.Path)
 	}
 
+	// Drop the stars whose file was deleted behind the server's back. In the
+	// background: it stats paths on the mounts, and a stalled network share
+	// must not keep the listener from coming up.
+	go stars.PruneMissing()
+
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("server: %v", err)
 		}
 	}()
 
+	// Once, because under the TUI two things can ask for it: the TUI returning
+	// and the SIGHUP watcher below. The second caller waits for the first.
+	var shutdownOnce sync.Once
 	shutdown := func() {
-		log.Println("shutting down, cleaning transcode sessions...")
-		mgr.CloseAll()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
+		shutdownOnce.Do(func() {
+			log.Println("shutting down, cleaning transcode sessions...")
+			mgr.CloseAll()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+		})
 	}
 
 	if useTUI {
-		restart, err := tui.Run(cfg, stars, applog.Default, "http://"+addr)
+		// Bubble Tea turns SIGINT and SIGTERM into a normal quit, but not
+		// SIGHUP — the terminal window closing, an ssh session dropping. Left
+		// to its default that killed the process outright: no CloseAll, so the
+		// running ffmpeg batches (their own process groups) carried on and the
+		// session dirs stayed behind until the next start.
+		//
+		// Cancelling the context makes the TUI return, which restores the
+		// terminal when there still is one (a plain `kill -HUP`) and lets main
+		// carry on into the normal shutdown below. The timer is for a TUI that
+		// can't get out of a terminal that has gone away.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			<-hup
+			cancel()
+			time.Sleep(3 * time.Second)
+			shutdown()
+			os.Exit(0)
+		}()
+		restart, err := tui.Run(ctx, cfg, stars, applog.Default, "http://"+addr)
 		shutdown()
 		if err != nil {
 			log.SetOutput(os.Stderr)

@@ -29,6 +29,7 @@ type Store struct {
 	entries []Entry
 	max     int
 	files   map[string]string // session id -> last-known filename
+	pruneAt int               // len(files) past which pruneFiles runs
 	partial []byte            // buffer for a not-yet-newline-terminated write
 	version uint64            // bumped on every appended entry
 }
@@ -41,7 +42,7 @@ func New(limit int) *Store {
 	if limit <= 0 {
 		limit = 1000
 	}
-	return &Store{max: limit, files: map[string]string{}}
+	return &Store{max: limit, files: map[string]string{}, pruneAt: filesSlack}
 }
 
 var (
@@ -86,7 +87,32 @@ func (s *Store) appendLine(line string) {
 	if len(s.entries) > s.max {
 		s.entries = s.entries[len(s.entries)-s.max:]
 	}
+	if len(s.files) > s.pruneAt {
+		s.pruneFiles()
+	}
 	s.version++
+}
+
+// filesSlack is how many session→filename associations may pile up beyond the
+// live ones before pruneFiles runs again.
+const filesSlack = 256
+
+// pruneFiles forgets the filenames of sessions with no line left in the
+// buffer. Every stream open is a session of its own, so on a long-running
+// server the map otherwise grows by one entry per video ever opened. Caller
+// holds mu.
+//
+// The next prune is scheduled relative to what survived, so a buffer that
+// legitimately spans many sessions doesn't rescan on every line.
+func (s *Store) pruneFiles() {
+	live := make(map[string]string, len(s.files))
+	for _, e := range s.entries {
+		if f, ok := s.files[e.Session]; ok {
+			live[e.Session] = f
+		}
+	}
+	s.files = live
+	s.pruneAt = 2*len(live) + filesSlack
 }
 
 // Version returns a counter bumped on each new entry; the TUI polls it to learn
